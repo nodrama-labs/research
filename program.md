@@ -1,9 +1,17 @@
-# autoresearch — trader-research
+# autoresearch — trader-research (bear specialist)
 
-Autonomously iterate on the ensemble strategy in this repo. The loop sweeps
-the parameters of the ensemble model one at a time. After each sweep, the
-best-scoring value is locked in as the new default and the loop moves to the
-next parameter. The scalar metric is `ensemble_score` from `harness.py`.
+Autonomously iterate on the **bear specialist** strategy in this repo. The
+full production stack is an HMM regime detector + per-regime specialists +
+meta-allocator; this repo carves out only the bear specialist, evaluated on
+the 2022 bear-market window over a small subset of tokens
+(`data/bear_portfolio_candles.csv`).
+
+The loop sweeps the parameters of the bear specialist one at a time. After
+each sweep, the best-scoring value is locked in as the new default and the
+loop moves to the next parameter. The scalar metric is `ensemble_score`
+from `harness.py` — the name is inherited from the full ensemble's scoring
+contract and stays fixed even though only one specialist is under test
+here.
 
 ## Setup
 
@@ -71,8 +79,8 @@ higher.
 
 ## Research directions (parameter priority)
 
-Sweep parameters in this order. After the winner of one parameter is
-locked in as the new default, move to the next.
+Sweep the bear-specialist parameters in this order. After the winner of
+one parameter is locked in as the new default, move to the next.
 
 **Tier 1 — structural knobs, sweep first:**
 

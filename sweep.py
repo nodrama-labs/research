@@ -2,7 +2,7 @@
 
 This file is the agent's playground. Everything here is fair game:
 
-  * ``GemParams`` -- the parameter struct defining the ensemble model.
+  * ``GemParams`` -- the parameter struct for the bear specialist.
   * The model body -- ``fit_token_exponential`` and ``build_portfolio`` and
     the regression / ATR primitives they call.
   * The sweep driver in ``main`` -- you decide which parameter to sweep, what
@@ -119,7 +119,8 @@ class Position:
 
 @dataclass
 class GemParams:
-    # Ensemble model parameters -- these are what the autoresearch loop sweeps.
+    # Bear-specialist parameters -- these are what the autoresearch loop sweeps.
+    # Scored by ``ensemble_score`` (name inherited from the full ensemble contract).
     r2_threshold: float = 0.5
     top_n: int = 5
     atr_window: int = 15
