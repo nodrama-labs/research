@@ -36,7 +36,7 @@ FEE_RATE = 0.003
 * Data Loading
 
 #+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
-df = pd.read_csv("bear_portfolio_candles.csv")
+df = pd.read_csv(os.path.join(DATA_DIR, "bear_portfolio_candles.csv"))
 df["date"] = pd.to_datetime(df["timestamp"], unit="ms")
 print(f"Loaded {len(df)} candles for {df['token'].nunique()} tokens")
 print(f"Date range: {df['date'].min().date()} to {df['date'].max().date()}")
@@ -871,7 +871,7 @@ print(f"Rally window:  {rally_start} to {rally_end}, {len(rally)} candles")
 : Bounce window: 2022-06-01 to 2022-07-01, 30 candles
 : Rally window:  2022-11-03 to 2022-12-03, 30 candles
 
-#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both :file images/r2_bounce_filter.png
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
 for ax, data, title_prefix in [
@@ -913,13 +913,15 @@ for ax, data, title_prefix in [
 
 fig.suptitle("PAXGUSDT: different 30-day windows", fontsize=12, fontweight='bold')
 plt.tight_layout()
-plt.savefig("../images/2026-04-24-gem-bear-market-models/r2_bounce_filter.png", dpi=150, bbox_inches='tight')
+IMAGES_DIR = os.path.join(HERE, "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
+out_path = os.path.join(IMAGES_DIR, "r2_bounce_filter.png")
+plt.savefig(out_path, dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved to images/2026-04-24-gem-bear-market-models/r2_bounce_filter.png")
+print(f"Saved to {out_path}")
 #+END_SRC
 
 #+RESULTS:
-: Saved to images/2026-04-24-gem-bear-market-models/r2_bounce_filter.png
 
 * Diagnostics: What do the models see with rolling windows?
 
