@@ -1,0 +1,1116 @@
+* Description
+
+Comparing exponential vs linear regression based GEM models for capital preservation during an established bear market.
+Determine whether the simpler linear model (~y = b0 + b1*x~) outperforms an exponential model (~y = a0 * a1^x~) when the market is grinding down.
+
+Window: May 1 - Dec 31, 2022 (established bear market).
+Token universe: bear portfolio (PAXGUSDT, EURUSDT, USDCUSDT, TUSDUSDT).
+
+* Setup
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+import os
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+from dataclasses import dataclass, field
+from typing import Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+# In this repo the notebook lives at notebooks/gem_bear_models.org and
+# the CSV at data/bear_portfolio_candles.csv. Resolve the data path
+# relative to the notebook so the same notebook works whether the kernel
+# is started from notebooks/ or from the repo root.
+HERE = os.path.dirname(os.path.abspath("__file__")) if "__file__" in globals() else os.getcwd()
+DATA_DIR = os.path.abspath(os.path.join(HERE, "..", "data"))
+if not os.path.isdir(DATA_DIR):
+    DATA_DIR = os.path.abspath("data")
+
+INITIAL_CAPITAL = 10_000.0
+FEE_RATE = 0.003
+#+END_SRC
+
+#+RESULTS:
+
+* Data Loading
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+df = pd.read_csv("bear_portfolio_candles.csv")
+df["date"] = pd.to_datetime(df["timestamp"], unit="ms")
+print(f"Loaded {len(df)} candles for {df['token'].nunique()} tokens")
+print(f"Date range: {df['date'].min().date()} to {df['date'].max().date()}")
+print()
+for token, g in df.groupby("token"):
+    print(f"  {token}: {len(g)} candles, {g['date'].min().date()} to {g['date'].max().date()}")
+#+END_SRC
+
+#+RESULTS:
+: Loaded 788 candles for 4 tokens
+: Date range: 2022-05-01 to 2022-12-31
+:
+:   EURUSDT: 245 candles, 2022-05-01 to 2022-12-31
+:   PAXGUSDT: 245 candles, 2022-05-01 to 2022-12-31
+:   TUSDUSDT: 149 candles, 2022-05-01 to 2022-09-26
+:   USDCUSDT: 149 candles, 2022-05-01 to 2022-09-26
+
+* Core Functions
+** Statistics
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def r_squared(y: np.ndarray, y_hat: np.ndarray) -> float:
+    ss_total = np.sum((y - np.mean(y)) ** 2)
+    ss_residual = np.sum((y - y_hat) ** 2)
+    if ss_total < 1e-12:
+        return 0.0
+    return 1.0 - ss_residual / ss_total
+
+def average_true_range(close: np.ndarray, high: np.ndarray, low: np.ndarray) -> float:
+    """ATR over [1..n], needs prior close at index 0."""
+    n = len(close)
+    if n < 2:
+        return 0.0
+    tr_sum = 0.0
+    for i in range(1, n):
+        tr = max(
+            high[i] - low[i],
+            abs(high[i] - close[i - 1]),
+            abs(low[i] - close[i - 1]),
+        )
+        tr_sum += tr
+    return tr_sum / (n - 1)
+#+END_SRC
+
+#+RESULTS:
+
+** Regression Models
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+# initial estimates
+def fit_linear_logspace(x: np.ndarray, y: np.ndarray):
+    """Fit ln(y) = b0 + b1*x via OLS. Returns (b0, b1)."""
+    ln_y = np.log(y)
+    X = np.column_stack([np.ones_like(x), x])
+    beta, _, _, _ = np.linalg.lstsq(X, ln_y, rcond=None)
+    return beta[0], beta[1]  # intercept, slope
+
+def fit_linear_pricespace(x: np.ndarray, y: np.ndarray):
+    """Fit y = b0 + b1*x via OLS in price-space. Returns (b0, b1)."""
+    X = np.column_stack([np.ones_like(x), x])
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    return beta[0], beta[1]
+
+def exponential_model(x, a0, a1):
+    return a0 * np.power(a1, x)
+
+def fit_exponential(x: np.ndarray, y: np.ndarray, initial: tuple):
+    """Fit y = a0 * a1^x via Levenberg-Marquardt. Returns (a0, a1)."""
+    try:
+        popt, _ = curve_fit(
+            exponential_model, x, y,
+            p0=initial,
+            method='lm',
+            maxfev=5000,
+        )
+        a0, a1 = popt
+        if np.isfinite(a0) and np.isfinite(a1):
+            return a0, a1
+    except (RuntimeError, ValueError):
+        pass
+    return initial
+#+END_SRC
+
+#+RESULTS:
+
+** Token Fitting
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+@dataclass
+class Position:
+    token: str
+    weight: float = 0.0
+    momentum: float = 0.0
+    r2: float = 0.0
+    a1: float = 0.0
+    atr: float = 0.0
+
+def fit_token_exponential(candles: pd.DataFrame, atr_window: int = 15, r2_exponent: float = 1.0) -> Optional[Position]:
+    """Exponential GEM pipeline: log-linear initial -> LM exponential refinement."""
+    if candles.empty:
+        return None
+
+    token = candles.iloc[0]["token"]
+    x = np.arange(len(candles), dtype=float)
+    closes = candles["close"].values
+    highs = candles["high"].values
+    lows = candles["low"].values
+
+    if np.any(closes <= 0):
+        return None
+
+    # Step 1: log-linear fit for initial estimates
+    try:
+        b0, b1 = fit_linear_logspace(x, closes)
+    except Exception:
+        return None
+
+    initial = (np.exp(b0), np.exp(b1))
+
+    # Step 2: exponential refinement via LM
+    a0, a1 = fit_exponential(x, closes, initial)
+
+    # R2 in price-space
+    y_hat = exponential_model(x, a0, a1)
+    r2 = r_squared(closes, y_hat)
+
+    # Momentum
+    momentum = (r2 ** r2_exponent) * (a1 - 1.0) * 100.0
+
+    # Normalized ATR (trailing window)
+    lookback = min(len(candles), atr_window)
+    mean_close = np.mean(closes)
+    if lookback > 1 and mean_close > 0:
+        atr = average_true_range(
+            closes[-lookback:],
+            highs[-lookback:],
+            lows[-lookback:],
+        ) / mean_close
+    else:
+        atr = 0.0
+
+    return Position(
+        token=token,
+        momentum=momentum,
+        r2=r2,
+        a1=a1,
+        atr=atr,
+    )
+#+END_SRC
+
+#+RESULTS:
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def fit_token_linear(candles: pd.DataFrame, atr_window: int = 15, r2_exponent: float = 1.0) -> Optional[Position]:
+    """Linear GEM: fit y = b0 + b1*x in price-space."""
+    if candles.empty:
+        return None
+
+    token = candles.iloc[0]["token"]
+    x = np.arange(len(candles), dtype=float)
+    closes = candles["close"].values
+    highs = candles["high"].values
+    lows = candles["low"].values
+
+    try:
+        b0, b1 = fit_linear_pricespace(x, closes)
+    except Exception:
+        return None
+
+    # R-squared in price-space
+    y_hat = b0 + b1 * x
+    r2 = r_squared(closes, y_hat)
+
+    # Momentum: normalized slope (b1 / mean_price) as percentage daily trend
+    mean_close = np.mean(closes)
+    if mean_close <= 0:
+        return None
+    normalized_slope = b1 / mean_close
+    momentum = (r2 ** r2_exponent) * normalized_slope * 100.0
+
+    # Growth filter (catches trend): a1 stores normalized_slope
+    # build_portfolio filters on a1 > 1, so we store 1 + normalized_slope
+    # positive slope -> a1 > 1, negative slope -> a1 < 1
+    a1_equiv = 1.0 + normalized_slope
+
+    # Normalized ATR (trailing window)
+    lookback = min(len(candles), atr_window)
+    if lookback > 1 and mean_close > 0:
+        atr = average_true_range(
+            closes[-lookback:],
+            highs[-lookback:],
+            lows[-lookback:],
+        ) / mean_close
+    else:
+        atr = 0.0
+
+    return Position(
+        token=token,
+        momentum=momentum,
+        r2=r2,
+        a1=a1_equiv,
+        atr=atr,
+    )
+#+END_SRC
+
+#+RESULTS:
+
+** Portfolio Construction
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+@dataclass
+class GemParams:
+    r2_threshold: float = 0.5
+    top_n: int = 20
+    atr_window: int = 15
+    fit_window: int = 0  # rolling lookback for regression (0 = use all history)
+    momentum_cap: float = 0.0
+    r2_exponent: float = 1.0
+    initial_capital: float = 10_000.0
+    fee_rate: float = 0.003
+    rebalance_cooldown: int = 7
+
+# params taken from previous experiments
+# portfolio geared towards capital preservation
+BEAR_PARAMS = GemParams(
+    top_n=1, r2_threshold=0.5, rebalance_cooldown=10,
+    momentum_cap=0.14, r2_exponent=2.0,
+)
+
+# params taken from previous experiments (ranging specialist)
+RANGING_PARAMS = GemParams(
+    top_n=8, r2_threshold=0.3, rebalance_cooldown=5,
+    momentum_cap=0.20, r2_exponent=1.5,
+)
+
+def build_portfolio(candidates: list[Position], params: GemParams) -> list[Position]:
+    """Filter by momentum/R2/growth, top-N, inverse-volatility weight by ATR."""
+    # Filter: a1 > 1 (growth), R2 above threshold, below momentum cap
+    filtered = [
+        p for p in candidates
+        if p.a1 > 1.0
+        and p.r2 > params.r2_threshold
+        and (params.momentum_cap <= 0.0 or p.momentum < params.momentum_cap)
+    ]
+
+    # Sort by momentum descending, take top N
+    filtered.sort(key=lambda p: p.momentum, reverse=True)
+    filtered = filtered[:params.top_n]
+
+    # Exclude ATR=0
+    filtered = [p for p in filtered if p.atr > 0.0]
+
+    if not filtered:
+        return []
+
+    # Inverse-volatility weighting
+    inv_vols = [1.0 / p.atr for p in filtered]
+    total_inv_vol = sum(inv_vols)
+    for p, iv in zip(filtered, inv_vols):
+        p.weight = iv / total_inv_vol
+
+    return filtered
+#+END_SRC
+
+#+RESULTS:
+
+** Portfolio State
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+@dataclass
+class HeldPosition:
+    quantity: float
+    entry_price: float
+
+@dataclass
+class DaySnapshot:
+    total_value: float
+    positions: dict  # token -> market value
+
+class PortfolioState:
+    def __init__(self, initial_capital: float):
+        self.cash = initial_capital
+        self.positions: dict[str, HeldPosition] = {}
+        self.peak_value = initial_capital
+        self.history: list[DaySnapshot] = []
+
+    def buy(self, token: str, price: float, amount: float, fee_rate: float):
+        fee = amount * fee_rate
+        net_amount = amount - fee
+        quantity = net_amount / price
+        self.cash -= amount
+        if token in self.positions:
+            self.positions[token].quantity += quantity
+        else:
+            self.positions[token] = HeldPosition(quantity=quantity, entry_price=price)
+
+    def sell(self, token: str, price: float, quantity: float, fee_rate: float):
+        gross = quantity * price
+        fee = gross * fee_rate
+        self.cash += gross - fee
+        if token in self.positions:
+            self.positions[token].quantity -= quantity
+            if self.positions[token].quantity <= 1e-12:
+                del self.positions[token]
+
+    def total_value(self, prices: dict[str, float]) -> float:
+        pos_value = sum(
+            pos.quantity * prices.get(token, pos.entry_price)
+            for token, pos in self.positions.items()
+        )
+        return self.cash + pos_value
+
+    def actual_weights(self, prices: dict[str, float]) -> dict[str, float]:
+        total = self.total_value(prices)
+        if total <= 0:
+            return {}
+        return {
+            token: (pos.quantity * prices.get(token, pos.entry_price)) / total
+            for token, pos in self.positions.items()
+        }
+
+    def record_snapshot(self, prices: dict[str, float]):
+        total = self.total_value(prices)
+        self.peak_value = max(self.peak_value, total)
+        pos_values = {
+            token: pos.quantity * prices.get(token, pos.entry_price)
+            for token, pos in self.positions.items()
+        }
+        self.history.append(DaySnapshot(total_value=total, positions=pos_values))
+#+END_SRC
+
+#+RESULTS:
+
+** Rebalancing
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def should_rebalance(
+    current_holdings: dict[str, float],
+    momentums: dict[str, float],
+    entry_threshold: float = 0.0,
+    exit_threshold: float = 0.0,
+) -> bool:
+    """Check signal crossing: momentum crosses entry/exit threshold."""
+    for token, momentum in momentums.items():
+        is_held = token in current_holdings
+        if not is_held and momentum > entry_threshold:
+            return True
+        if is_held and momentum < exit_threshold:
+            return True
+    return False
+
+def is_in_cooldown(current_day: int, last_rebalance_day: Optional[int], cooldown_days: int) -> bool:
+    if last_rebalance_day is None:
+        return False
+    return cooldown_days > 0 and (current_day - last_rebalance_day) < cooldown_days
+
+def rebalance_to_targets(
+    state: PortfolioState,
+    target_weights: dict[str, float],
+    prices: dict[str, float],
+    fee_rate: float,
+):
+    """Differential rebalancing - only trade positions that changed."""
+    total_value = state.total_value(prices)
+    min_trade_value = total_value * 0.001
+
+    # Step 1: sell positions not in target or overweight
+    for token in list(state.positions.keys()):
+        price = prices.get(token, state.positions[token].entry_price)
+        current_qty = state.positions[token].quantity
+        current_value = current_qty * price
+        target_value = target_weights.get(token, 0.0) * total_value
+        sell_value = current_value - target_value
+        if sell_value > min_trade_value:
+            sell_qty = sell_value / price
+            state.sell(token, price, sell_qty, fee_rate)
+
+    # Recompute after sells
+    total_value = state.total_value(prices)
+
+    # Step 2: buy new or underweight positions
+    for token, target_weight in target_weights.items():
+        price = prices.get(token)
+        if price is None:
+            continue
+        target_value = total_value * target_weight
+        current_value = 0.0
+        if token in state.positions:
+            current_value = state.positions[token].quantity * price
+        buy_amount = target_value - current_value
+        if buy_amount > min_trade_value:
+            buy_amount = min(buy_amount, state.cash)
+            if buy_amount > 0:
+                state.buy(token, price, buy_amount, fee_rate)
+#+END_SRC
+
+#+RESULTS:
+
+* GEM Backtest (Exponential)
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def gem_backtest(params: GemParams, candles_by_token: dict[str, pd.DataFrame], fit_fn) -> dict:
+    """
+    GEM day-loop. fit_fn is the token fitting function (exponential or linear).
+    Returns dict with metrics and equity curve.
+    """
+    eligible = candles_by_token
+
+    # Union of all timestamps
+    all_timestamps = sorted(set(
+        ts for c in eligible.values() for ts in c["timestamp"].values
+    ))
+
+    if not all_timestamps:
+        return _empty_metrics()
+
+    # Precompute price index: token -> {timestamp -> close}
+    price_index = {
+        token: dict(zip(c["timestamp"].values, c["close"].values))
+        for token, c in eligible.items()
+    }
+
+    state = PortfolioState(params.initial_capital)
+    rebalance_count = 0
+    last_rebalance_day = None
+    target_weights = {}
+
+    for day_idx, timestamp in enumerate(all_timestamps):
+        # Current prices
+        prices = {
+            token: ts_map[timestamp]
+            for token, ts_map in price_index.items()
+            if timestamp in ts_map
+        }
+
+        # Fit tokens using candles up to the current timestamp
+        # If fit_window > 0, use only the trailing N candles for regression
+        fit_results = {}
+        for token, candles in eligible.items():
+            up_to = candles[candles["timestamp"] <= timestamp]
+            if params.fit_window > 0 and len(up_to) > params.fit_window:
+                up_to = up_to.iloc[-params.fit_window:]
+            if len(up_to) >= 2:
+                pos = fit_fn(up_to, params.atr_window, params.r2_exponent)
+                if pos is not None:
+                    fit_results[token] = pos
+
+        # Rebalance decision
+        need_rebalance = False
+        if day_idx == 0:
+            need_rebalance = True
+        elif not is_in_cooldown(day_idx, last_rebalance_day, params.rebalance_cooldown):
+            momentums = {t: p.momentum for t, p in fit_results.items()}
+            holdings = {t: p.quantity for t, p in state.positions.items()}
+            need_rebalance = should_rebalance(holdings, momentums)
+
+        if need_rebalance:
+            candidates = list(fit_results.values())
+            portfolio = build_portfolio(candidates, params)
+
+            target_weights = {p.token: p.weight for p in portfolio}
+            rebalance_to_targets(state, target_weights, prices, params.fee_rate)
+
+            rebalance_count += 1
+            last_rebalance_day = day_idx
+
+        state.record_snapshot(prices)
+
+    return _compute_metrics(state, rebalance_count, all_timestamps)
+#+END_SRC
+
+#+RESULTS:
+
+* Metrics Computation
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def _empty_metrics():
+    return {
+        "total_return_pct": 0.0, "annualized_return_pct": 0.0,
+        "max_drawdown_pct": 0.0, "sharpe_ratio": 0.0, "sortino_ratio": 0.0,
+        "calmar_ratio": 0.0, "rebalance_count": 0, "win_rate_pct": 0.0,
+        # time series of portfolio value over time, stored for plotting
+        "equity_curve": [],
+    }
+
+def _compute_metrics(state: PortfolioState, rebalance_count: int, timestamps: list) -> dict:
+    history = state.history
+    if len(history) < 2:
+        return _empty_metrics()
+
+    values = np.array([s.total_value for s in history])
+    initial_value = values[0]
+    final_value = values[-1]
+    total_return = (final_value - initial_value) / initial_value
+
+    days = len(history)
+    years = days / 365.0
+    annualized_return = (1.0 + total_return) ** (1.0 / years) - 1.0
+
+    # Max drawdown
+    peak = np.maximum.accumulate(values)
+    drawdowns = (peak - values) / peak
+    max_drawdown = np.max(drawdowns)
+
+    # Daily returns
+    daily_returns = np.diff(values) / values[:-1]
+
+    # Sharpe (annualized)
+    mean_r = np.mean(daily_returns)
+    std_r = np.std(daily_returns)
+    sharpe = (mean_r / std_r * np.sqrt(252)) if std_r > 1e-12 else 0.0
+
+    # Sortino (annualized)
+    downside = daily_returns[daily_returns < 0]
+    downside_dev = np.sqrt(np.sum(downside ** 2) / len(daily_returns)) if len(daily_returns) > 0 else 0.0
+    sortino = (mean_r / downside_dev * np.sqrt(252)) if downside_dev > 1e-12 else 0.0
+
+    # Calmar
+    calmar = (annualized_return / max_drawdown) if max_drawdown > 1e-12 else 0.0
+
+    # Monthly returns (30-day chunks)
+    monthly_returns = []
+    chunk_size = min(30, len(values))
+    if chunk_size > 0:
+        for i in range(0, len(values), chunk_size):
+            chunk = values[i:i + chunk_size]
+            if len(chunk) > 1:
+                monthly_returns.append((chunk[-1] - chunk[0]) / chunk[0])
+
+    win_rate = (
+        sum(1 for r in monthly_returns if r > 0) / len(monthly_returns) * 100
+        if monthly_returns else 0.0
+    )
+
+    # Equity curve with dates
+    dates = pd.to_datetime(np.array(timestamps[:len(values)]), unit="ms")
+
+    return {
+        "total_return_pct": total_return * 100,
+        "annualized_return_pct": annualized_return * 100,
+        "max_drawdown_pct": -max_drawdown * 100,
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "calmar_ratio": calmar,
+        "rebalance_count": rebalance_count,
+        "win_rate_pct": win_rate,
+        "equity_curve": list(zip(dates, values)),
+        "final_value": final_value,
+    }
+
+def print_metrics(label: str, m: dict):
+    print(f"\n{'=' * 50}")
+    print(f"  {label}")
+    print(f"{'=' * 50}")
+    print(f"  Total return:      {m['total_return_pct']:>8.2f}%")
+    print(f"  Annualized return: {m['annualized_return_pct']:>8.2f}%")
+    print(f"  Max drawdown:      {m['max_drawdown_pct']:>8.2f}%")
+    print(f"  Sharpe ratio:      {m['sharpe_ratio']:>8.3f}")
+    print(f"  Sortino ratio:     {m['sortino_ratio']:>8.3f}")
+    print(f"  Calmar ratio:      {m['calmar_ratio']:>8.3f}")
+    print(f"  Rebalance count:   {m['rebalance_count']:>8d}")
+    print(f"  Win rate (monthly):{m['win_rate_pct']:>8.1f}%")
+    print(f"  Final value:       ${m.get('final_value', 0):>10.2f}")
+#+END_SRC
+
+#+RESULTS:
+
+* Run: Window Sweep
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+# Prepare candles by token
+candles_by_token = {token: group.sort_values("timestamp").reset_index(drop=True)
+                    for token, group in df.groupby("token")}
+
+from dataclasses import replace
+from copy import deepcopy
+
+results = {}
+fit_windows = [15, 30, 60]
+param_configs = {"bear": BEAR_PARAMS, "ranging": RANGING_PARAMS}
+model_fns = {"exp": fit_token_exponential, "lin": fit_token_linear}
+
+for window in fit_windows:
+    for param_name, base_params in param_configs.items():
+        params = replace(base_params, fit_window=window)
+        for model_name, fit_fn in model_fns.items():
+            label = f"{model_name}-{param_name}-w{window}"
+            result = gem_backtest(params, candles_by_token, fit_fn)
+            results[label] = result
+            print_metrics(label, result)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+
+  ==================================================
+    exp-bear-w15
+  ==================================================
+    Total return:         -6.27%
+    Annualized return:    -9.19%
+    Max drawdown:         -8.77%
+    Sharpe ratio:        -1.461
+    Sortino ratio:       -2.088
+    Calmar ratio:        -1.048
+    Rebalance count:         24
+    Win rate (monthly):    22.2%
+    Final value:       $   9373.20
+
+  ==================================================
+    lin-bear-w15
+  ==================================================
+    Total return:         -6.27%
+    Annualized return:    -9.19%
+    Max drawdown:         -8.77%
+    Sharpe ratio:        -1.461
+    Sortino ratio:       -2.088
+    Calmar ratio:        -1.048
+    Rebalance count:         24
+    Win rate (monthly):    22.2%
+    Final value:       $   9373.20
+
+  ==================================================
+    exp-ranging-w15
+  ==================================================
+    Total return:         -9.28%
+    Annualized return:   -13.51%
+    Max drawdown:        -10.42%
+    Sharpe ratio:        -1.944
+    Sortino ratio:       -2.514
+    Calmar ratio:        -1.297
+    Rebalance count:         45
+    Win rate (monthly):    22.2%
+    Final value:       $   9071.60
+
+  ==================================================
+    lin-ranging-w15
+  ==================================================
+    Total return:         -8.36%
+    Annualized return:   -12.20%
+    Max drawdown:         -9.84%
+    Sharpe ratio:        -1.316
+    Sortino ratio:       -1.797
+    Calmar ratio:        -1.239
+    Rebalance count:         46
+    Win rate (monthly):    11.1%
+    Final value:       $   9163.90
+
+  ==================================================
+    exp-bear-w30
+  ==================================================
+    Total return:          6.40%
+    Annualized return:     9.69%
+    Max drawdown:         -1.39%
+    Sharpe ratio:         1.593
+    Sortino ratio:        3.332
+    Calmar ratio:         6.982
+    Rebalance count:         21
+    Win rate (monthly):    33.3%
+    Final value:       $  10640.43
+
+  ==================================================
+    lin-bear-w30
+  ==================================================
+    Total return:          6.40%
+    Annualized return:     9.69%
+    Max drawdown:         -1.39%
+    Sharpe ratio:         1.593
+    Sortino ratio:        3.332
+    Calmar ratio:         6.982
+    Rebalance count:         21
+    Win rate (monthly):    33.3%
+    Final value:       $  10640.43
+
+  ==================================================
+    exp-ranging-w30
+  ==================================================
+    Total return:         -0.28%
+    Annualized return:    -0.42%
+    Max drawdown:         -9.42%
+    Sharpe ratio:        -0.020
+    Sortino ratio:       -0.031
+    Calmar ratio:        -0.044
+    Rebalance count:         29
+    Win rate (monthly):    33.3%
+    Final value:       $   9972.08
+
+  ==================================================
+    lin-ranging-w30
+  ==================================================
+    Total return:         -0.34%
+    Annualized return:    -0.50%
+    Max drawdown:         -7.88%
+    Sharpe ratio:        -0.039
+    Sortino ratio:       -0.058
+    Calmar ratio:        -0.064
+    Rebalance count:         30
+    Win rate (monthly):    33.3%
+    Final value:       $   9966.27
+
+  ==================================================
+    exp-bear-w60
+  ==================================================
+    Total return:          3.77%
+    Annualized return:     5.67%
+    Max drawdown:         -1.10%
+    Sharpe ratio:         1.132
+    Sortino ratio:        2.336
+    Calmar ratio:         5.144
+    Rebalance count:         19
+    Win rate (monthly):    33.3%
+    Final value:       $  10377.04
+
+  ==================================================
+    lin-bear-w60
+  ==================================================
+    Total return:          3.77%
+    Annualized return:     5.67%
+    Max drawdown:         -1.10%
+    Sharpe ratio:         1.132
+    Sortino ratio:        2.336
+    Calmar ratio:         5.144
+    Rebalance count:         19
+    Win rate (monthly):    33.3%
+    Final value:       $  10377.04
+
+  ==================================================
+    exp-ranging-w60
+  ==================================================
+    Total return:         -1.02%
+    Annualized return:    -1.51%
+    Max drawdown:         -5.30%
+    Sharpe ratio:        -0.273
+    Sortino ratio:       -0.396
+    Calmar ratio:        -0.285
+    Rebalance count:         37
+    Win rate (monthly):    22.2%
+    Final value:       $   9898.34
+
+  ==================================================
+    lin-ranging-w60
+  ==================================================
+    Total return:         -1.02%
+    Annualized return:    -1.51%
+    Max drawdown:         -5.30%
+    Sharpe ratio:        -0.273
+    Sortino ratio:       -0.396
+    Calmar ratio:        -0.285
+    Rebalance count:         37
+    Win rate (monthly):    22.2%
+    Final value:       $   9898.34
+
+  ==================================================
+    exp-bear-w90
+  ==================================================
+    Total return:          0.49%
+    Annualized return:     0.73%
+    Max drawdown:         -0.91%
+    Sharpe ratio:         0.465
+    Sortino ratio:        0.660
+    Calmar ratio:         0.799
+    Rebalance count:         13
+    Win rate (monthly):    11.1%
+    Final value:       $  10048.70
+
+  ==================================================
+    lin-bear-w90
+  ==================================================
+    Total return:          0.49%
+    Annualized return:     0.73%
+    Max drawdown:         -0.91%
+    Sharpe ratio:         0.465
+    Sortino ratio:        0.660
+    Calmar ratio:         0.799
+    Rebalance count:         13
+    Win rate (monthly):    11.1%
+    Final value:       $  10048.70
+
+  ==================================================
+    exp-ranging-w90
+  ==================================================
+    Total return:         -1.52%
+    Annualized return:    -2.26%
+    Max drawdown:         -4.30%
+    Sharpe ratio:        -0.494
+    Sortino ratio:       -0.671
+    Calmar ratio:        -0.525
+    Rebalance count:         20
+    Win rate (monthly):    22.2%
+    Final value:       $   9847.97
+
+  ==================================================
+    lin-ranging-w90
+  ==================================================
+    Total return:         -1.52%
+    Annualized return:    -2.26%
+    Max drawdown:         -4.30%
+    Sharpe ratio:        -0.494
+    Sortino ratio:       -0.671
+    Calmar ratio:        -0.525
+    Rebalance count:         20
+    Win rate (monthly):    22.2%
+    Final value:       $   9847.97
+#+end_example
+
+* Plot: R-squared as a "dead cat bounce" filter
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+paxg = candles_by_token["PAXGUSDT"]
+paxg_dates = pd.to_datetime(paxg["timestamp"], unit="ms")
+
+# Find a dead cat bounce: PAXG drops hard in May-June, brief bounce mid-June, then continues down
+# Window 1: "dead cat bounce" — pick 30 days around the June bounce
+bounce_start = "2022-06-01"
+bounce_end = "2022-07-01"
+mask_bounce = (paxg_dates >= bounce_start) & (paxg_dates < bounce_end)
+bounce = paxg[mask_bounce].reset_index(drop=True)
+
+# Window 2: genuine rally — PAXG Nov rally (matches our winner's entry period)
+rally_start = "2022-11-03"
+rally_end = "2022-12-03"
+mask_rally = (paxg_dates >= rally_start) & (paxg_dates < rally_end)
+rally = paxg[mask_rally].reset_index(drop=True)
+
+print(f"Bounce window: {bounce_start} to {bounce_end}, {len(bounce)} candles")
+print(f"Rally window:  {rally_start} to {rally_end}, {len(rally)} candles")
+#+END_SRC
+
+#+RESULTS:
+: Bounce window: 2022-06-01 to 2022-07-01, 30 candles
+: Rally window:  2022-11-03 to 2022-12-03, 30 candles
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both :file images/r2_bounce_filter.png
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+for ax, data, title_prefix in [
+    (ax1, bounce, "Dead cat bounce"),
+    (ax2, rally, "Genuine rally"),
+]:
+    dates = pd.to_datetime(data["timestamp"], unit="ms")
+    closes = data["close"].values
+    x = np.arange(len(closes), dtype=float)
+
+    # Fit linear model
+    b0, b1 = fit_linear_pricespace(x, closes)
+    y_hat = b0 + b1 * x
+    r2 = r_squared(closes, y_hat)
+    mean_price = np.mean(closes)
+    norm_slope = b1 / mean_price
+
+    # Fit exponential model
+    b0_log, b1_log = fit_linear_logspace(x, closes)
+    a0, a1 = fit_exponential(x, closes, (np.exp(b0_log), np.exp(b1_log)))
+    y_hat_exp = exponential_model(x, a0, a1)
+    r2_exp = r_squared(closes, y_hat_exp)
+
+    ax.plot(dates, closes, 'k-', linewidth=1.5, label='PAXG price')
+    ax.plot(dates, y_hat, 'b--', linewidth=2, label=f'Linear (R²={r2:.3f})')
+    ax.plot(dates, y_hat_exp, 'r:', linewidth=2, label=f'Exponential (R²={r2_exp:.3f})')
+
+    slope_sign = "+" if b1 > 0 else ""
+    growth = "PASS" if (1.0 + norm_slope) > 1.0 else "FAIL"
+    r2_pass = "PASS" if r2 > 0.5 else "FAIL"
+
+    ax.set_title(f"{title_prefix}\nslope: {slope_sign}{norm_slope*100:.3f}%/day  |  growth: {growth}  |  R² filter: {r2_pass}",
+                 fontsize=10)
+    ax.legend(fontsize=8, loc='best')
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+    ax.tick_params(axis='x', rotation=45)
+    ax.set_ylabel('Price (USDT)')
+    ax.grid(True, alpha=0.3)
+
+fig.suptitle("PAXGUSDT: different 30-day windows", fontsize=12, fontweight='bold')
+plt.tight_layout()
+plt.savefig("../images/2026-04-24-gem-bear-market-models/r2_bounce_filter.png", dpi=150, bbox_inches='tight')
+plt.show()
+print("Saved to images/2026-04-24-gem-bear-market-models/r2_bounce_filter.png")
+#+END_SRC
+
+#+RESULTS:
+: Saved to images/2026-04-24-gem-bear-market-models/r2_bounce_filter.png
+
+* Diagnostics: What do the models see with rolling windows?
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+sample_dates = ["2022-06-15", "2022-08-01", "2022-10-15", "2022-12-01"]
+windows = [15, 30, 60, 0]  # 0 = all history
+
+for date_str in sample_dates:
+    ts = int(pd.Timestamp(date_str).timestamp() * 1000)
+    print(f"\n{'='*80}")
+    print(f"  {date_str}")
+    print(f"{'='*80}")
+    print(f"  {'token':<12} {'model':<6} {'win':>4} {'a1/equiv':>10} {'r2':>8} {'momentum':>10} {'pass_all':>9}")
+    print(f"  {'-'*12} {'-'*6} {'-'*4} {'-'*10} {'-'*8} {'-'*10} {'-'*9}")
+
+    for token, candles in candles_by_token.items():
+        up_to = candles[candles["timestamp"] <= ts]
+        if len(up_to) < 2:
+            continue
+
+        for model_name, fit_fn in [("exp", fit_token_exponential), ("lin", fit_token_linear)]:
+            for w in windows:
+                sliced = up_to.iloc[-w:] if w > 0 and len(up_to) > w else up_to
+                if len(sliced) < 2:
+                    continue
+                pos = fit_fn(sliced, atr_window=15, r2_exponent=1.0)
+                if pos is None:
+                    continue
+                pass_all = "Y" if (pos.a1 > 1.0 and pos.r2 > 0.3) else "N"
+                wlabel = str(w) if w > 0 else "all"
+                print(f"  {token:<12} {model_name:<6} {wlabel:>4} {pos.a1:>10.6f} {pos.r2:>8.4f} {pos.momentum:>10.4f} {pass_all:>9}")
+#+END_SRC
+
+* Holdings Analysis: bear-w30 winner
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+from dataclasses import replace
+
+params = replace(BEAR_PARAMS, fit_window=30)
+eligible = candles_by_token
+
+all_timestamps = sorted(set(
+    ts for c in eligible.values() for ts in c["timestamp"].values
+))
+price_index = {
+    token: dict(zip(c["timestamp"].values, c["close"].values))
+    for token, c in eligible.items()
+}
+
+state = PortfolioState(params.initial_capital)
+last_rebalance_day = None
+fit_fn = fit_token_exponential
+
+print(f"{'day':>4} {'date':<12} {'action':<10} {'held':<12} {'momentum':>10} {'r2':>8} {'value':>10}")
+print(f"{'-'*4} {'-'*12} {'-'*10} {'-'*12} {'-'*10} {'-'*8} {'-'*10}")
+
+for day_idx, timestamp in enumerate(all_timestamps):
+    prices = {
+        token: ts_map[timestamp]
+        for token, ts_map in price_index.items()
+        if timestamp in ts_map
+    }
+
+    fit_results = {}
+    for token, candles in eligible.items():
+        up_to = candles[candles["timestamp"] <= timestamp]
+        if params.fit_window > 0 and len(up_to) > params.fit_window:
+            up_to = up_to.iloc[-params.fit_window:]
+        if len(up_to) >= 2:
+            pos = fit_fn(up_to, params.atr_window, params.r2_exponent)
+            if pos is not None:
+                fit_results[token] = pos
+
+    need_rebalance = False
+    if day_idx == 0:
+        need_rebalance = True
+    elif not is_in_cooldown(day_idx, last_rebalance_day, params.rebalance_cooldown):
+        momentums = {t: p.momentum for t, p in fit_results.items()}
+        holdings = {t: p.quantity for t, p in state.positions.items()}
+        need_rebalance = should_rebalance(holdings, momentums)
+
+    if need_rebalance:
+        candidates = list(fit_results.values())
+        portfolio = build_portfolio(candidates, params)
+        target_weights = {p.token: p.weight for p in portfolio}
+        rebalance_to_targets(state, target_weights, prices, params.fee_rate)
+        last_rebalance_day = day_idx
+
+        date_str = pd.Timestamp(timestamp, unit="ms").strftime("%Y-%m-%d")
+        held_tokens = list(state.positions.keys())
+        held_str = ",".join(held_tokens) if held_tokens else "CASH"
+        total_val = state.total_value(prices)
+
+        # Show the selected token's stats
+        if portfolio:
+            p = portfolio[0]
+            print(f"{day_idx:>4} {date_str:<12} {'REBAL':<10} {held_str:<12} {p.momentum:>10.4f} {p.r2:>8.4f} {total_val:>10.2f}")
+        else:
+            print(f"{day_idx:>4} {date_str:<12} {'TO CASH':<10} {'CASH':<12} {'':>10} {'':>8} {total_val:>10.2f}")
+
+    state.record_snapshot(prices)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+   day date         action     held           momentum       r2      value
+  ---- ------------ ---------- ------------ ---------- -------- ----------
+     0 2022-05-01   TO CASH    CASH                               10000.00
+    10 2022-05-11   TO CASH    CASH                               10000.00
+    20 2022-05-21   TO CASH    CASH                               10000.00
+    30 2022-05-31   TO CASH    CASH                               10000.00
+    40 2022-06-10   TO CASH    CASH                               10000.00
+    50 2022-06-20   TO CASH    CASH                               10000.00
+    60 2022-06-30   TO CASH    CASH                               10000.00
+    93 2022-08-02   TO CASH    CASH                               10000.00
+   103 2022-08-12   TO CASH    CASH                               10000.00
+   113 2022-08-22   TO CASH    CASH                               10000.00
+  123 2022-09-01   TO CASH    CASH                               10000.00
+  138 2022-09-16   TO CASH    CASH                               10000.00
+  162 2022-10-10   TO CASH    CASH                               10000.00
+  172 2022-10-20   TO CASH    CASH                               10000.00
+  182 2022-10-30   TO CASH    CASH                               10000.00
+  192 2022-11-09   REBAL      EURUSDT          0.0222   0.5021    9970.00
+  202 2022-11-19   REBAL      EURUSDT          0.0868   0.6758   10340.74
+  212 2022-11-29   REBAL      EURUSDT          0.1182   0.7516   10312.76
+  222 2022-12-09   REBAL      EURUSDT          0.0442   0.7052   10524.61
+  232 2022-12-19   REBAL      PAXGUSDT         0.0858   0.7897   10539.04
+  242 2022-12-29   REBAL      EURUSDT          0.0290   0.7041   10574.95
+#+end_example
+
+* Buy & Hold Benchmark
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def buy_and_hold(candles_by_token: dict[str, pd.DataFrame], initial_capital: float = 10_000.0) -> dict:
+    """Equal-weight buy & hold across all tokens in the universe."""
+    # Find common timestamp range
+    all_timestamps = sorted(set(
+        ts for c in candles_by_token.values() for ts in c["timestamp"].values
+    ))
+
+    price_index = {
+        token: dict(zip(c["timestamp"].values, c["close"].values))
+        for token, c in candles_by_token.items()
+    }
+
+    # Buy equal weight on first day
+    state = PortfolioState(initial_capital)
+    first_ts = all_timestamps[0]
+    first_prices = {
+        token: ts_map[first_ts]
+        for token, ts_map in price_index.items()
+        if first_ts in ts_map
+    }
+
+    tokens_available = list(first_prices.keys())
+    if not tokens_available:
+        return _empty_metrics()
+
+    weight = 1.0 / len(tokens_available)
+    for token in tokens_available:
+        amount = initial_capital * weight
+        state.buy(token, first_prices[token], amount, FEE_RATE)
+
+    # Record daily snapshots
+    for timestamp in all_timestamps:
+        prices = {
+            token: ts_map[timestamp]
+            for token, ts_map in price_index.items()
+            if timestamp in ts_map
+        }
+        state.record_snapshot(prices)
+
+    return _compute_metrics(state, 0, all_timestamps)
+
+bh = buy_and_hold(candles_by_token)
+print_metrics("Buy & Hold - Bear Portfolio (equal weight)", bh)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+
+  ==================================================
+    Buy & Hold - Bear Portfolio (equal weight)
+  ==================================================
+    Total return:         -0.65%
+    Annualized return:    -0.97%
+    Max drawdown:         -6.01%
+    Sharpe ratio:        -0.117
+    Sortino ratio:       -0.171
+    Calmar ratio:        -0.161
+    Rebalance count:          0
+    Win rate (monthly):    44.4%
+    Final value:       $   9905.15
+#+end_example
