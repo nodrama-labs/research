@@ -1,33 +1,27 @@
-"""Deterministic encoding of the autoresearch contract over the bear portfolio.
+"""Modifiable interior of the trader-research autoresearch loop.
 
-This script is the public, runnable counterpart to the historical Karpathy-style
-autoresearch loop runs that produced the post-mortems in
-``docs/autoresearch-reports/``. The historical runs were LLM-driven against a
-private Rust framework over 437 tokens; this script is hand-driven Python over
-the 4-token bear portfolio used in ``notebooks/gem_bear_models.org``. Same
-scoring shape, same deletion mandate, same council mode -- smaller universe,
-deterministic hypothesis selection.
+This file is the agent's playground. Everything here is fair game:
 
-The point is to make the contract executable and citable. Every claim in the
-companion blog post can be reproduced by running this file.
+  * ``GemParams`` -- the parameter struct defining the ensemble model.
+  * The model body -- ``fit_token_exponential`` and ``build_portfolio`` and
+    the regression / ATR primitives they call.
+  * The sweep driver in ``main`` -- you decide which parameter to sweep, what
+    candidate values to try, and how to log the result.
 
-Usage:
-    python sweep.py [--max-experiments N] [--seed S]
+The harness in ``harness.py`` is *not* modifiable. It owns the data loader,
+the backtest skeleton, the scoring function, and the canonical fee /
+capital constants. ``evaluate`` from the harness is the only currency the
+loop trusts.
 
-Outputs:
-    results/bear_sweep_results.tsv -- one row per experiment, append-only.
-    stdout                         -- per-experiment summary line.
+Default usage:
 
-Design notes:
-    * Parameter axes mirror Loop 3 Phase 2 (``top_n`` x ``r2_threshold`` x
-      ``rebalance_cooldown``), pinned to the bear-portfolio universe.
-    * The mandatory deletion rule and council mode are encoded as a small
-      hand-written vocabulary -- in the original loop the LLM picked from a
-      similar shortlist; here the choice is deterministic so the run is
-      reproducible.
-    * Scoring follows ``program.md`` (annualized return * drawdown dampener *
-      diversification bonus), with the hard-rejection gate evaluated under a
-      1.5x fee stress.
+    python sweep.py --param top_n --values 1,3,5,10
+    python sweep.py --param r2_threshold --values 0.3,0.5,0.7,0.8
+
+The script sweeps a single named parameter across the supplied values,
+holding everything else at the current defaults in ``GemParams``. It prints
+one line per candidate, appends rows to ``results/bear_sweep_results.tsv``,
+and prints the winner.
 """
 
 from __future__ import annotations
@@ -36,31 +30,27 @@ import argparse
 import csv
 import math
 import os
-import random
 import sys
 import time
-from copy import deepcopy
-from dataclasses import asdict, dataclass, field, replace
-from typing import Callable, Iterable, Optional
+from dataclasses import asdict, dataclass, replace
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
 
+from harness import (
+    DATA_PATH,
+    FEE_RATE,
+    INITIAL_CAPITAL,
+    RESULTS_PATH,
+    evaluate,
+    load_candles,
+)
+
 
 # ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(REPO_ROOT, "data", "bear_portfolio_candles.csv")
-RESULTS_PATH = os.path.join(REPO_ROOT, "results", "bear_sweep_results.tsv")
-
-
-# ---------------------------------------------------------------------------
-# GEM primitives -- mirror notebooks/gem_bear_models.org for a self-contained
-# script. If the notebook diverges, the notebook is the source of truth and
-# this file should be brought into sync.
+# Model body -- regression primitives
 # ---------------------------------------------------------------------------
 
 
@@ -111,6 +101,11 @@ def fit_exponential(x: np.ndarray, y: np.ndarray, initial: tuple):
     return initial
 
 
+# ---------------------------------------------------------------------------
+# Position + parameters
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class Position:
     token: str
@@ -119,6 +114,35 @@ class Position:
     r2: float = 0.0
     a1: float = 0.0
     atr: float = 0.0
+    quantity: float = 0.0  # only set on held positions
+
+
+@dataclass
+class GemParams:
+    # Ensemble model parameters -- these are what the autoresearch loop sweeps.
+    r2_threshold: float = 0.5
+    top_n: int = 5
+    atr_window: int = 15
+    fit_window: int = 30
+    momentum_cap: float = 0.14
+    r2_exponent: float = 2.0
+    rebalance_cooldown: int = 7
+
+    # Ablation flags. Toggle off currently-active components for deletion runs.
+    use_r2_filter: bool = True
+    use_growth_filter: bool = True
+    use_momentum_cap: bool = True
+    use_inverse_vol_weighting: bool = True
+    pick_lowest_momentum: bool = False
+
+    # Required by the harness; canonicalized inside ``evaluate``. Do not sweep.
+    fee_rate: float = FEE_RATE
+    initial_capital: float = INITIAL_CAPITAL
+
+
+# ---------------------------------------------------------------------------
+# Model body -- fit + portfolio construction
+# ---------------------------------------------------------------------------
 
 
 def fit_token_exponential(
@@ -163,33 +187,6 @@ def fit_token_exponential(
     return Position(token=token, momentum=momentum, r2=r2, a1=a1, atr=atr)
 
 
-# ---------------------------------------------------------------------------
-# Strategy parameters and ablation flags
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class GemParams:
-    r2_threshold: float = 0.5
-    top_n: int = 5
-    atr_window: int = 15
-    fit_window: int = 30
-    momentum_cap: float = 0.14
-    r2_exponent: float = 2.0
-    initial_capital: float = 10_000.0
-    fee_rate: float = 0.003
-    rebalance_cooldown: int = 7
-
-    # Ablation flags. The deletion mandate flips these to disable
-    # currently-active components of the strategy. Defaults reflect the
-    # production stack for the bear specialist.
-    use_r2_filter: bool = True
-    use_growth_filter: bool = True
-    use_momentum_cap: bool = True
-    use_inverse_vol_weighting: bool = True
-    pick_lowest_momentum: bool = False  # contrarian council move
-
-
 def build_portfolio(candidates: list[Position], params: GemParams) -> list[Position]:
     filtered = list(candidates)
 
@@ -221,477 +218,55 @@ def build_portfolio(candidates: list[Position], params: GemParams) -> list[Posit
 
 
 # ---------------------------------------------------------------------------
-# Portfolio bookkeeping
+# Sweep driver -- one parameter at a time
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class HeldPosition:
-    quantity: float
-    entry_price: float
+def parse_value(raw: str, default):
+    """Coerce a CLI string to the type of the default value."""
+    if isinstance(default, bool):
+        return raw.lower() in ("1", "true", "yes", "on")
+    if isinstance(default, int):
+        return int(raw)
+    if isinstance(default, float):
+        return float(raw)
+    return raw
 
 
-@dataclass
-class DaySnapshot:
-    total_value: float
-    positions: dict
-
-
-class PortfolioState:
-    def __init__(self, initial_capital: float):
-        self.cash = initial_capital
-        self.positions: dict[str, HeldPosition] = {}
-        self.peak_value = initial_capital
-        self.history: list[DaySnapshot] = []
-
-    def buy(self, token: str, price: float, amount: float, fee_rate: float):
-        fee = amount * fee_rate
-        net_amount = amount - fee
-        quantity = net_amount / price
-        self.cash -= amount
-        if token in self.positions:
-            self.positions[token].quantity += quantity
-        else:
-            self.positions[token] = HeldPosition(quantity=quantity, entry_price=price)
-
-    def sell(self, token: str, price: float, quantity: float, fee_rate: float):
-        gross = quantity * price
-        fee = gross * fee_rate
-        self.cash += gross - fee
-        if token in self.positions:
-            self.positions[token].quantity -= quantity
-            if self.positions[token].quantity <= 1e-12:
-                del self.positions[token]
-
-    def total_value(self, prices: dict[str, float]) -> float:
-        pos_value = sum(
-            pos.quantity * prices.get(token, pos.entry_price)
-            for token, pos in self.positions.items()
-        )
-        return self.cash + pos_value
-
-    def actual_weights(self, prices: dict[str, float]) -> dict[str, float]:
-        total = self.total_value(prices)
-        if total <= 0:
-            return {}
-        return {
-            token: (pos.quantity * prices.get(token, pos.entry_price)) / total
-            for token, pos in self.positions.items()
-        }
-
-    def record_snapshot(self, prices: dict[str, float]):
-        total = self.total_value(prices)
-        self.peak_value = max(self.peak_value, total)
-        pos_values = {
-            token: pos.quantity * prices.get(token, pos.entry_price)
-            for token, pos in self.positions.items()
-        }
-        self.history.append(DaySnapshot(total_value=total, positions=pos_values))
-
-
-def should_rebalance(
-    current_holdings: dict[str, float],
-    momentums: dict[str, float],
-    entry_threshold: float = 0.0,
-    exit_threshold: float = 0.0,
-) -> bool:
-    for token, momentum in momentums.items():
-        is_held = token in current_holdings
-        if not is_held and momentum > entry_threshold:
-            return True
-        if is_held and momentum < exit_threshold:
-            return True
-    return False
-
-
-def is_in_cooldown(
-    current_day: int, last_rebalance_day: Optional[int], cooldown_days: int
-) -> bool:
-    if last_rebalance_day is None:
-        return False
-    return cooldown_days > 0 and (current_day - last_rebalance_day) < cooldown_days
-
-
-def rebalance_to_targets(
-    state: PortfolioState,
-    target_weights: dict[str, float],
-    prices: dict[str, float],
-    fee_rate: float,
-):
-    total_value = state.total_value(prices)
-    min_trade_value = total_value * 0.001
-
-    for token in list(state.positions.keys()):
-        price = prices.get(token, state.positions[token].entry_price)
-        current_qty = state.positions[token].quantity
-        current_value = current_qty * price
-        target_value = target_weights.get(token, 0.0) * total_value
-        sell_value = current_value - target_value
-        if sell_value > min_trade_value:
-            sell_qty = sell_value / price
-            state.sell(token, price, sell_qty, fee_rate)
-
-    total_value = state.total_value(prices)
-
-    for token, target_weight in target_weights.items():
-        price = prices.get(token)
-        if price is None:
-            continue
-        target_value = total_value * target_weight
-        current_value = 0.0
-        if token in state.positions:
-            current_value = state.positions[token].quantity * price
-        buy_amount = target_value - current_value
-        if buy_amount > min_trade_value:
-            buy_amount = min(buy_amount, state.cash)
-            if buy_amount > 0:
-                state.buy(token, price, buy_amount, fee_rate)
-
-
-# ---------------------------------------------------------------------------
-# Backtest + metrics
-# ---------------------------------------------------------------------------
-
-
-def gem_backtest(
-    params: GemParams,
+def sweep_one_parameter(
+    param_name: str,
+    values: list,
     candles_by_token: dict[str, pd.DataFrame],
-    fit_fn: Callable = fit_token_exponential,
-) -> dict:
-    eligible = candles_by_token
-
-    all_timestamps = sorted(
-        set(ts for c in eligible.values() for ts in c["timestamp"].values)
-    )
-    if not all_timestamps:
-        return _empty_metrics()
-
-    price_index = {
-        token: dict(zip(c["timestamp"].values, c["close"].values))
-        for token, c in eligible.items()
-    }
-
-    state = PortfolioState(params.initial_capital)
-    rebalance_count = 0
-    last_rebalance_day = None
-    target_weights: dict[str, float] = {}
-
-    for day_idx, timestamp in enumerate(all_timestamps):
-        prices = {
-            token: ts_map[timestamp]
-            for token, ts_map in price_index.items()
-            if timestamp in ts_map
-        }
-
-        fit_results = {}
-        for token, candles in eligible.items():
-            up_to = candles[candles["timestamp"] <= timestamp]
-            if params.fit_window > 0 and len(up_to) > params.fit_window:
-                up_to = up_to.iloc[-params.fit_window :]
-            if len(up_to) >= 2:
-                pos = fit_fn(up_to, params.atr_window, params.r2_exponent)
-                if pos is not None:
-                    fit_results[token] = pos
-
-        need_rebalance = False
-        if day_idx == 0:
-            need_rebalance = True
-        elif not is_in_cooldown(day_idx, last_rebalance_day, params.rebalance_cooldown):
-            momentums = {t: p.momentum for t, p in fit_results.items()}
-            holdings = {t: p.quantity for t, p in state.positions.items()}
-            need_rebalance = should_rebalance(holdings, momentums)
-
-        if need_rebalance:
-            candidates = list(fit_results.values())
-            portfolio = build_portfolio(candidates, params)
-            target_weights = {p.token: p.weight for p in portfolio}
-            rebalance_to_targets(state, target_weights, prices, params.fee_rate)
-            rebalance_count += 1
-            last_rebalance_day = day_idx
-
-        state.record_snapshot(prices)
-
-    return _compute_metrics(state, rebalance_count)
-
-
-def _empty_metrics() -> dict:
-    return {
-        "total_return_pct": 0.0,
-        "annualized_return_pct": 0.0,
-        "max_drawdown_pct": 0.0,
-        "sharpe_ratio": 0.0,
-        "sortino_ratio": 0.0,
-        "calmar_ratio": 0.0,
-        "rebalance_count": 0,
-        "hhi": 1.0,
-        "final_value": 0.0,
-    }
-
-
-def _compute_metrics(state: PortfolioState, rebalance_count: int) -> dict:
-    history = state.history
-    if len(history) < 2:
-        return _empty_metrics()
-
-    values = np.array([s.total_value for s in history])
-    initial_value = values[0]
-    final_value = values[-1]
-    total_return = (final_value - initial_value) / initial_value
-
-    days = len(history)
-    years = days / 365.0
-    annualized_return = (1.0 + total_return) ** (1.0 / max(years, 1e-9)) - 1.0
-
-    peak = np.maximum.accumulate(values)
-    drawdowns = (peak - values) / peak
-    max_drawdown = float(np.max(drawdowns))
-
-    daily_returns = np.diff(values) / values[:-1]
-    mean_r = float(np.mean(daily_returns))
-    std_r = float(np.std(daily_returns))
-    sharpe = (mean_r / std_r * np.sqrt(252)) if std_r > 1e-12 else 0.0
-
-    downside = daily_returns[daily_returns < 0]
-    downside_dev = (
-        np.sqrt(np.sum(downside ** 2) / len(daily_returns))
-        if len(daily_returns) > 0
-        else 0.0
-    )
-    sortino = (mean_r / downside_dev * np.sqrt(252)) if downside_dev > 1e-12 else 0.0
-    calmar = (annualized_return / max_drawdown) if max_drawdown > 1e-12 else 0.0
-
-    # Average HHI over the final-week of holdings, as a stand-in for the
-    # production "avg over rebalance days" metric. Bear portfolio rebalances
-    # rarely; this is close enough for the diversification bonus.
-    last_snap = history[-1]
-    last_total = last_snap.total_value if last_snap.total_value > 0 else 1.0
-    weights = [v / last_total for v in last_snap.positions.values()]
-    cash_weight = 1.0 - sum(weights)
-    if cash_weight > 1e-9:
-        weights.append(cash_weight)
-    hhi = float(sum(w * w for w in weights)) if weights else 1.0
-
-    return {
-        "total_return_pct": total_return * 100,
-        "annualized_return_pct": annualized_return * 100,
-        "max_drawdown_pct": -max_drawdown * 100,
-        "sharpe_ratio": sharpe,
-        "sortino_ratio": sortino,
-        "calmar_ratio": calmar,
-        "rebalance_count": rebalance_count,
-        "hhi": hhi,
-        "final_value": final_value,
-    }
-
-
-def ensemble_score(base: dict, stress: dict) -> float:
-    """Match program.md: return * dd_dampener * div_bonus, with hard gates."""
-    annualized = base["annualized_return_pct"] / 100.0
-    if annualized < -0.50:
-        return float("-inf")
-    if stress["calmar_ratio"] < 0.0:
-        return float("-inf")
-
-    dd = abs(base["max_drawdown_pct"]) / 100.0
-    dampener = 1.0 / (1.0 + max(0.0, dd - 0.15)) ** 2
-    div_bonus = 1.0 + 0.1 * (1.0 - base["hhi"])
-    return annualized * dampener * div_bonus
-
-
-def evaluate(params: GemParams, candles_by_token) -> tuple[float, dict, dict]:
-    base = gem_backtest(params, candles_by_token)
-    stress_params = replace(params, fee_rate=params.fee_rate * 1.5)
-    stress = gem_backtest(stress_params, candles_by_token)
-    score = ensemble_score(base, stress)
-    return score, base, stress
-
-
-# ---------------------------------------------------------------------------
-# Experiment plan -- streaming hypothesis selector that honors the contract
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Experiment:
-    idx: int
-    kind: str  # "grid" | "deletion" | "council"
-    philosophy: str  # short tag, e.g. "scale_change", "contrarian"
-    params: GemParams
-    description: str
-
-
-# Components that the deletion mandate is allowed to toggle off, in the order
-# they're cycled through. Mirrors the "currently-active component" wording in
-# program.md.
-DELETION_TARGETS = [
-    ("use_r2_filter", "delete R^2 filter"),
-    ("use_growth_filter", "delete a1>1 growth filter"),
-    ("use_momentum_cap", "delete momentum cap"),
-    ("use_inverse_vol_weighting", "swap inverse-vol -> equal weights"),
-]
-
-
-COUNCIL_PHILOSOPHIES = [
-    "scale_change",
-    "contrarian",
-    "regime_shift",
-    "simplification",
-]
-
-
-def make_grid(rng: random.Random) -> list[GemParams]:
-    """Phase-2-style grid: top_n x r2_threshold x rebalance_cooldown."""
-    top_ns = [1, 3, 5]
-    r2s = [0.3, 0.5, 0.7]
-    cds = [5, 7, 10]
-    base = GemParams()
-    grid = []
-    for top_n in top_ns:
-        for r2 in r2s:
-            for cd in cds:
-                grid.append(replace(base, top_n=top_n, r2_threshold=r2, rebalance_cooldown=cd))
-    rng.shuffle(grid)
-    return grid
-
-
-def deletion_experiment(idx: int, baseline: GemParams, deletion_round: int) -> Experiment:
-    flag, label = DELETION_TARGETS[deletion_round % len(DELETION_TARGETS)]
-    p = replace(baseline, **{flag: False})
-    return Experiment(
-        idx=idx,
-        kind="deletion",
-        philosophy="simplification",
-        params=p,
-        description=f"deletion: {label}",
-    )
-
-
-def council_experiment(
-    idx: int, baseline: GemParams, council_round: int, last_philosophy: str
-) -> Experiment:
-    """Pick a non-repeating philosophy and apply a structural change."""
-    candidates = [p for p in COUNCIL_PHILOSOPHIES if p != last_philosophy]
-    philosophy = candidates[council_round % len(candidates)]
-
-    if philosophy == "scale_change":
-        p = replace(baseline, top_n=max(1, baseline.top_n * 10))
-        desc = f"council/scale_change: 10x top_n -> {p.top_n}"
-    elif philosophy == "contrarian":
-        p = replace(baseline, pick_lowest_momentum=True)
-        desc = "council/contrarian: pick lowest momentum (mean-reversion)"
-    elif philosophy == "regime_shift":
-        # Stand-in regime gate for a 4-token universe: widen the fit window
-        # so the strategy reacts to the slower trend instead of the recent
-        # bounce. Matches the "BTC 200d MA risk-off" spirit of the original
-        # rule on a portfolio without BTC.
-        p = replace(baseline, fit_window=90)
-        desc = "council/regime_shift: switch to slow trend (fit_window=90)"
-    elif philosophy == "simplification":
-        p = replace(
-            baseline,
-            use_r2_filter=False,
-            use_momentum_cap=False,
-            use_inverse_vol_weighting=False,
-        )
-        desc = "council/simplification: strip optional filters"
-    else:
-        p = baseline
-        desc = "council/noop"
-
-    return Experiment(
-        idx=idx,
-        kind="council",
-        philosophy=philosophy,
-        params=p,
-        description=desc,
-    )
-
-
-def plan_iter(
-    grid: list[GemParams], max_experiments: int
-) -> Iterable[Experiment]:
-    """Yield experiments honoring the deletion mandate and council mode.
-
-    Streaming generator that needs feedback from the runner via send() to
-    detect stagnation. We approximate that by yielding placeholder
-    experiments and letting the runner override the kind via mutation; the
-    cleaner shape is for the runner to drive the state machine directly.
-    """
-    raise NotImplementedError("driven by run() instead")
-
-
-def run(
-    candles_by_token: dict[str, pd.DataFrame],
-    max_experiments: int,
-    seed: int,
+    baseline: GemParams,
 ) -> list[dict]:
-    rng = random.Random(seed)
-    grid = make_grid(rng)
+    if not hasattr(baseline, param_name):
+        raise ValueError(f"GemParams has no field {param_name!r}")
 
     rows: list[dict] = []
     best_score = float("-inf")
-    best_params: Optional[GemParams] = None
-    consecutive_stagnant = 0
-    deletion_round = 0
-    council_round = 0
-    last_philosophy = ""
-
-    grid_idx = 0
-    exp_idx = 0
+    best_value = None
     started = time.time()
 
-    while exp_idx < max_experiments:
-        # Selection rules, in priority:
-        # 1. Council mode after 5 stagnant non-improvements (overrides #2 + #3
-        #    for one experiment).
-        # 2. Mandatory deletion every 5th experiment.
-        # 3. Otherwise, walk the grid.
-        baseline = best_params if best_params is not None else GemParams()
+    print(f"\nSweeping {param_name} over {values}")
+    print(f"Baseline: {_describe(baseline)}\n")
 
-        if consecutive_stagnant >= 5:
-            exp = council_experiment(exp_idx, baseline, council_round, last_philosophy)
-            council_round += 1
-            consecutive_stagnant = 0
-        elif exp_idx > 0 and exp_idx % 5 == 0:
-            exp = deletion_experiment(exp_idx, baseline, deletion_round)
-            deletion_round += 1
-        else:
-            if grid_idx >= len(grid):
-                # Grid exhausted -- fall back to council to keep exploring.
-                exp = council_experiment(
-                    exp_idx, baseline, council_round, last_philosophy
-                )
-                council_round += 1
-            else:
-                p = grid[grid_idx]
-                grid_idx += 1
-                exp = Experiment(
-                    idx=exp_idx,
-                    kind="grid",
-                    philosophy="grid",
-                    params=p,
-                    description=(
-                        f"grid: top_n={p.top_n} r2={p.r2_threshold} cd={p.rebalance_cooldown}"
-                    ),
-                )
+    for i, raw in enumerate(values):
+        value = parse_value(str(raw), getattr(baseline, param_name))
+        params = replace(baseline, **{param_name: value})
 
-        score, base, stress = evaluate(exp.params, candles_by_token)
+        score, base, stress = evaluate(
+            params, candles_by_token, fit_token_exponential, build_portfolio
+        )
 
-        if math.isfinite(score) and score > best_score:
+        kept = math.isfinite(score) and score > best_score
+        if kept:
             best_score = score
-            best_params = exp.params
-            outcome = "kept"
-            consecutive_stagnant = 0
-        else:
-            outcome = "discarded"
-            consecutive_stagnant += 1
-
-        last_philosophy = exp.philosophy
+            best_value = value
 
         row = {
-            "exp": exp.idx,
-            "kind": exp.kind,
-            "philosophy": exp.philosophy,
+            "exp": i,
+            "param": param_name,
+            "value": value,
             "score": score,
             "annualized_return_pct": base["annualized_return_pct"],
             "max_drawdown_pct": base["max_drawdown_pct"],
@@ -702,63 +277,60 @@ def run(
             "hhi": base["hhi"],
             "rebalance_count": base["rebalance_count"],
             "best_so_far": best_score,
-            "outcome": outcome,
-            "description": exp.description,
-            "top_n": exp.params.top_n,
-            "r2_threshold": exp.params.r2_threshold,
-            "rebalance_cooldown": exp.params.rebalance_cooldown,
-            "fit_window": exp.params.fit_window,
-            "use_r2_filter": exp.params.use_r2_filter,
-            "use_growth_filter": exp.params.use_growth_filter,
-            "use_momentum_cap": exp.params.use_momentum_cap,
-            "use_inverse_vol_weighting": exp.params.use_inverse_vol_weighting,
-            "pick_lowest_momentum": exp.params.pick_lowest_momentum,
+            "outcome": "kept" if kept else "discarded",
+            "description": f"{param_name}={value}",
         }
+        for k, v in asdict(params).items():
+            if k not in row:
+                row[k] = v
         rows.append(row)
         print(_format_row(row))
 
-        exp_idx += 1
-
     elapsed = time.time() - started
     print(
-        f"\nDone. {len(rows)} experiments in {elapsed:.1f}s. "
-        f"Best score: {best_score:.4f} ({_describe(best_params)})"
+        f"\nDone. {len(rows)} candidates in {elapsed:.1f}s. "
+        f"Best: {param_name}={best_value} (score={best_score:.4f})"
     )
     return rows
 
 
 def _format_row(row: dict) -> str:
-    score_str = "-inf" if not math.isfinite(row["score"]) else f"{row['score']:8.3f}"
+    score_str = "-inf" if not math.isfinite(row["score"]) else f"{row['score']:8.4f}"
     return (
-        f"#{row['exp']:>3} {row['kind']:<8} {row['philosophy']:<14} "
+        f"#{row['exp']:>3} {row['param']:<22} = {str(row['value']):<10} "
         f"score={score_str} "
         f"ann={row['annualized_return_pct']:>7.2f}% "
         f"dd={row['max_drawdown_pct']:>7.2f}% "
         f"calmar_stress={row['calmar_stress']:>6.2f} "
-        f"best={row['best_so_far']:8.3f} {row['outcome']:<10} "
-        f"-- {row['description']}"
+        f"best={row['best_so_far']:8.4f} {row['outcome']:<10}"
     )
 
 
-def _describe(params: Optional[GemParams]) -> str:
-    if params is None:
-        return "no winner"
-    return (
-        f"top_n={params.top_n} r2={params.r2_threshold} "
-        f"cd={params.rebalance_cooldown} fit_window={params.fit_window}"
+def _describe(params: GemParams) -> str:
+    keys = (
+        "top_n",
+        "r2_threshold",
+        "rebalance_cooldown",
+        "atr_window",
+        "fit_window",
+        "momentum_cap",
+        "r2_exponent",
     )
+    return " ".join(f"{k}={getattr(params, k)}" for k in keys)
 
 
-def write_tsv(rows: list[dict], path: str) -> None:
+def append_rows(rows: list[dict], path: str = RESULTS_PATH) -> None:
     if not rows:
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fieldnames = list(rows[0].keys())
-    with open(path, "w", newline="") as fh:
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         writer.writerows(rows)
-    print(f"Wrote {len(rows)} rows to {path}")
+    print(f"Appended {len(rows)} rows to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -766,47 +338,39 @@ def write_tsv(rows: list[dict], path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_candles(path: str = DATA_PATH) -> dict[str, pd.DataFrame]:
-    df = pd.read_csv(path)
-    return {
-        token: g.sort_values("timestamp").reset_index(drop=True)
-        for token, g in df.groupby("token")
-    }
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
-        "--max-experiments",
-        type=int,
-        default=30,
-        help="Total experiments to run. Default 30 covers the grid plus several deletion + council slots.",
+        "--param",
+        required=True,
+        help="GemParams field to sweep (e.g. top_n, r2_threshold, rebalance_cooldown).",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="RNG seed for grid order. Same seed = same plan.",
+        "--values",
+        required=True,
+        help="Comma-separated candidate values (e.g. '1,3,5,10').",
     )
     parser.add_argument(
         "--no-write",
         action="store_true",
-        help="Skip writing the TSV (useful for smoke tests).",
+        help="Skip appending to results.tsv (useful for smoke tests).",
     )
     args = parser.parse_args(argv)
 
     if not os.path.exists(DATA_PATH):
-        print(
-            f"error: missing {DATA_PATH}. Did you commit data/bear_portfolio_candles.csv?",
-            file=sys.stderr,
-        )
+        print(f"error: missing {DATA_PATH}", file=sys.stderr)
+        return 1
+
+    values = [v.strip() for v in args.values.split(",") if v.strip()]
+    if not values:
+        print("error: --values is empty", file=sys.stderr)
         return 1
 
     candles_by_token = load_candles(DATA_PATH)
-    rows = run(candles_by_token, args.max_experiments, args.seed)
+    rows = sweep_one_parameter(args.param, values, candles_by_token, GemParams())
 
     if not args.no_write:
-        write_tsv(rows, RESULTS_PATH)
+        append_rows(rows, RESULTS_PATH)
 
     return 0
 
