@@ -66,23 +66,28 @@ is the agent's playground (parameters, model body, driver). See
 
 The data + control flow:
 
-```
-data/bear_portfolio_candles.csv
-       │
-       ▼
-  harness.load_candles
-       │  candles_by_token
-       ▼
-  harness.evaluate(params, ──── fit_fn = sweep.fit_token_exponential
-                   candles,     portfolio_fn = sweep.build_portfolio
-                   fit_fn,      (called by harness.gem_backtest)
-                   portfolio_fn)
-       │
-       ▼
-  base + stress metrics ─► harness.ensemble_score ─► scalar
-       │
-       ▼
-  sweep_one_parameter ─► append row to results/bear_sweep_results.tsv
+```mermaid
+flowchart TD
+    csv[("data/bear_portfolio_candles.csv")]
+    load["harness.load_candles"]
+    eval["harness.evaluate(params, candles, fit_fn, portfolio_fn)"]
+    fit["sweep.fit_token_exponential"]
+    port["sweep.build_portfolio"]
+    bt["harness.gem_backtest<br/>(base + 1.5x fee stress)"]
+    metrics["base + stress metrics"]
+    score["harness.ensemble_score"]
+    sweep["sweep_one_parameter"]
+    tsv[("results/bear_sweep_results.tsv")]
+
+    csv --> load
+    load -->|candles_by_token| eval
+    fit -. injected as fit_fn .-> eval
+    port -. injected as portfolio_fn .-> eval
+    eval --> bt
+    bt --> metrics
+    metrics --> score
+    score -->|scalar| sweep
+    sweep -->|append row| tsv
 ```
 
 ## Notebooks
@@ -112,26 +117,27 @@ Columns: `token, timestamp, open, high, low, close, volume`.
 
 **GEM signal pipeline (per token, per day):**
 
-```
-candles[-fit_window:]
-       │
-       ▼
-fit y = a0 · a1ˣ ──► r² ──► momentum = r²ⁿ · (a1 - 1) · 100
-       │
-       ▼
-ATR over last `atr_window` candles ──► atr / mean_close
-       │
-       ▼
-       Position(token, momentum, r2, a1, atr)
-                              │
-                              ▼
-              filter on growth (a1 > 1), r², momentum cap
-                              │
-                              ▼
-                  sort by momentum, take top_n
-                              │
-                              ▼
-              weight by 1 / atr   (inverse-volatility)
+```mermaid
+flowchart TD
+    candles["candles[-fit_window:]"]
+    fit["fit y = a0 · a1ˣ"]
+    r2["r²"]
+    mom["momentum = r²ⁿ · (a1 − 1) · 100"]
+    atr["ATR over last atr_window candles<br/>÷ mean_close"]
+    pos["Position(token, momentum, r2, a1, atr)"]
+    filter["filter: growth (a1 > 1), r² ≥ threshold, momentum cap"]
+    sort["sort by momentum, take top_n"]
+    weight["weight by 1 / atr<br/>(inverse-volatility)"]
+
+    candles --> fit
+    fit --> r2
+    r2 --> mom
+    candles --> atr
+    mom --> pos
+    atr --> pos
+    pos --> filter
+    filter --> sort
+    sort --> weight
 ```
 
 Sections in the notebook: Description, Setup, Data Loading, Core
@@ -153,6 +159,32 @@ Open questions:
 - funding-rate cost vs. the current 30 bps round-trip fee budget
 - sizing under leverage
 - whether the hard-rejection gate on stress-test calmar still makes sense once shorting is allowed.
+
+A second direction is a **reinforcement-learning search policy** as a
+replacement for the autoresearch loop itself. The current loop is a
+hand-coded one-parameter-at-a-time scan; an RL agent would learn the
+search heuristics from the score signal directly — for example,
+"after finding a good `r2_threshold`, explore `top_n`" emerges from
+training rather than being hard-wired in `program.md`.
+
+Sketch:
+
+- **State**: the current `GemParams` tensor plus a summary of past
+  evaluations ("where am I in the search space?") — e.g. a fixed-size
+  embedding of the last K (params, score) pairs, or per-axis quantile
+  positions of already-tried values.
+- **Action**: a parameter edit — pick an axis, pick a direction or a new
+  value (discrete or continuous head per parameter).
+- **Reward**: `ensemble_score` from `harness.py`, possibly shaped by the
+  delta against the current best.
+- **Environment**: a thin wrapper around the same walk-forward causal
+  backtest used in the bear-GEM notebook and `harness.evaluate`. The
+  scoring contract stays fixed; only the search policy changes.
+
+This is also the natural setting in which to compare phased single-block
+sweeping against a true joint-space search and check how much of the
+historical "deletion wins" finding survives once interactions are
+modeled explicitly.
 
 ## License
 
