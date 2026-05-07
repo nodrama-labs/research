@@ -32,35 +32,35 @@ is the agent's playground (parameters, model body, driver). See
 
 **`harness.py`:**
 
-- `load_candles(path)` — read the candles CSV, return a `dict[token, DataFrame]`.
-- `PortfolioState`, `HeldPosition`, `DaySnapshot` — portfolio bookkeeping.
-- `gem_backtest(params, candles_by_token, fit_fn, portfolio_fn)` — day-by-day
+- `load_candles(path)` -- read the candles CSV, return a `dict[token, DataFrame]`.
+- `PortfolioState`, `HeldPosition`, `DaySnapshot` -- portfolio bookkeeping.
+- `gem_backtest(params, candles_by_token, fit_fn, portfolio_fn)` -- day-by-day
   causal walk-forward. `fit_fn` and `portfolio_fn` are injected from
   `sweep.py`, so the backtest skeleton stays fixed while the model body
   stays modifiable.
-- `ensemble_score(base, stress)` — the single scalar metric the loop
+- `ensemble_score(base, stress)` -- the single scalar metric the loop
   optimizes. `score = annualized_return × drawdown_dampener × diversification_bonus`,
   with hard rejection on annualized return below -50% or negative
   stress-test calmar. The name is inherited from the full ensemble's
   scoring contract; only the bear specialist is under test in this repo.
-- `evaluate(params, candles_by_token, fit_fn, portfolio_fn)` — runs base +
+- `evaluate(params, candles_by_token, fit_fn, portfolio_fn)` -- runs base +
   1.5× fee-stress backtests, returns `(score, base_metrics, stress_metrics)`.
   Pins `FEE_RATE` and `INITIAL_CAPITAL` regardless of caller params.
 - `FEE_RATE = 0.003`, `FEE_STRESS_MULTIPLIER = 1.5`, `INITIAL_CAPITAL = 10_000.0`.
 
 **`sweep.py` (modifiable interior):**
 
-- `GemParams` — bear-specialist parameter struct: `top_n`, `r2_threshold`,
+- `GemParams` -- bear-specialist parameter struct: `top_n`, `r2_threshold`,
   `rebalance_cooldown`, `atr_window`, `fit_window`, `momentum_cap`,
   `r2_exponent`, plus `use_*` ablation flags.
-- `Position` — output of the per-token fit (token, momentum, r2, a1, atr,
+- `Position` -- output of the per-token fit (token, momentum, r2, a1, atr,
   weight).
-- `fit_token_exponential(candles, atr_window, r2_exponent)` — fits
+- `fit_token_exponential(candles, atr_window, r2_exponent)` -- fits
   `y = a0 · a1ˣ` to closes, computes `momentum = r²ⁿ · (a1 - 1) · 100`
   and ATR-normalized volatility.
-- `build_portfolio(candidates, params)` — applies the r²/growth/momentum
+- `build_portfolio(candidates, params)` -- applies the r²/growth/momentum
   filters, picks `top_n`, weights by inverse volatility (or equal).
-- `sweep_one_parameter(name, values, candles, baseline)` — runs the
+- `sweep_one_parameter(name, values, candles, baseline)` -- runs the
   one-at-a-time sweep, scores each candidate via `harness.evaluate`,
   prints per-candidate diagnostics.
 
@@ -102,7 +102,7 @@ extracted from. Originally published alongside the
 [_Winning with the Bear_](https://blog.nodrama.io/gem-bear-market-models/)
 blog post.
 
-**Data:** `data/bear_portfolio_candles.csv` — 788 daily candles across 4
+**Data:** `data/bear_portfolio_candles.csv` -- 788 daily candles across 4
 tokens, **May 1 – Dec 31, 2022** (the established 2022 bear market).
 Universe is intentionally a stablecoin / safe-haven basket:
 
@@ -148,7 +148,7 @@ Benchmark, plus narrative sections on rolling-window analysis, the R²
 ## Future directions
 
 The current bear specialist is a long-only stablecoin / safe-haven rotator
-— it preserves capital in a bear market but cannot profit from the
+-- it preserves capital in a bear market but cannot profit from the
 downtrend itself. A natural extension is a more aggressive bear model
 built on [dYdX](https://docs.dydx.xyz/) perpetual futures, which would
 let the strategy take short positions on the tokens it currently filters
@@ -163,17 +163,17 @@ Open questions:
 A second direction is a **reinforcement-learning search policy** as a
 replacement for the autoresearch loop itself. The current loop is a
 hand-coded one-parameter-at-a-time scan; an RL agent would learn the
-search heuristics from the score signal directly — for example,
+search heuristics from the score signal directly -- for example,
 "after finding a good `r2_threshold`, explore `top_n`" emerges from
 training rather than being hard-wired in `program.md`.
 
 Sketch:
 
 - **State**: the current `GemParams` tensor plus a summary of past
-  evaluations ("where am I in the search space?") — e.g. a fixed-size
+  evaluations ("where am I in the search space?") -- e.g. a fixed-size
   embedding of the last K (params, score) pairs, or per-axis quantile
   positions of already-tried values.
-- **Action**: a parameter edit — pick an axis, pick a direction or a new
+- **Action**: a parameter edit -- pick an axis, pick a direction or a new
   value (discrete or continuous head per parameter).
 - **Reward**: `ensemble_score` from `harness.py`, possibly shaped by the
   delta against the current best.
