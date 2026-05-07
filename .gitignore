@@ -24,6 +24,7 @@ Thumbs.db
 # Local sweep outputs (commit selectively)
 results/*.tsv
 !results/.gitkeep
+*.log
 
 # Local secrets
 .env
