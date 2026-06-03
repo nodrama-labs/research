@@ -12,8 +12,7 @@ Properties:
 - Sits deeply negative across sustained drawdowns; the longer the
   drawdown, the more time d_t spends far from 0.
 - *Causal*: the running max uses only data up to t, so this
-  observation has no lookahead. Removes the Phase-0.5a hindsight
-  critique (full-window z-score uses end-of-window info).
+  observation has no lookahead.
 - Economically natural: drawdown *is* what defines a bear in trader
   vocabulary.
 
@@ -69,9 +68,8 @@ RNG_SEED = 20260603
 
 * Data Loading
 
-The only substantive change from Phase 0.5a: ~obs~ is now the drawdown
-from rolling max. ~log_return~ and ~log_price~ are kept on the frame
-for diagnostics.
+~obs~ is the drawdown from rolling max. ~log_return~ and ~log_price~
+are kept on the frame for diagnostics.
 
 #+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
 df = pd.read_csv(os.path.join(DATA_DIR, "btcusdt_daily.csv"))
@@ -101,8 +99,8 @@ print(f"Days with d_t < -1.0 (~ -63% drawdown): {int((obs < -1.0).sum())} / {len
 
 * HMM core — shared forward-backward + Baum-Welch
 
-Identical to Phase 0 and 0.5a. Reproduced verbatim so this notebook is
-self-contained.
+Standard log-space EM for HMMs with Gaussian or Student's-t emissions,
+plus a Viterbi decoder. Self-contained — no external HMM dependency.
 
 ** Forward-backward in log-space
 
@@ -470,9 +468,8 @@ plt.show()
 
 * Pass criterion — 2022 only
 
-Same flip-counting rule as Phase 0/0.5a: Viterbi for primary, argmax-
-of-marginal as a sanity check. crit3 compares Student-t to Gaussian at
-the same K.
+Flip count from Viterbi for the primary metric, argmax-of-marginal as
+a sanity check. crit3 compares Student-t to Gaussian at the same K.
 
 #+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
 def viterbi_states_canonical(fit, order):
@@ -577,7 +574,7 @@ for K in (2, 3):
 * Decision gate
 
 #+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
-print("\n=== Phase 0.5b verdict ===\n")
+print("\n=== Verdict ===\n")
 for K in (2, 3):
     r = evaluate_2022(K)
     print(f"K = {K}: Student-t-vs-Gaussian = {r['verdict_student_t_vs_g']}, "
@@ -590,16 +587,15 @@ for K in (2, 3):
 
 ** Hypothesis under test
 
-Phase 0.5b tested whether replacing scaled log-price (Phase 0.5a) with
-*drawdown from rolling max* — a strictly causal observation that maps
-directly to the trader definition of a bear — produces an equally good
-or better identification of 2022 as a sustained bear regime on the
-same window, with the same EM machinery.
+Whether *drawdown from rolling max* — a strictly causal observation
+that maps directly to the trader definition of a bear — produces a
+clean identification of 2022 as a sustained bear regime on the
+2021-06 → 2023-06 BTCUSDT window, with standard Gaussian / Student's-t
+HMM emissions at K ∈ {2, 3}.
 
 ** What we found
 
-The hypothesis survives, and the result is materially cleaner than
-Phase 0.5a on the K = 3 decomposition.
+The hypothesis survives, with a particularly clean K = 3 decomposition.
 
 | Metric (over calendar 2022)             | Gaussian K=2 | Student-t K=2 | Gaussian K=3 | Student-t K=3 |
 |-----------------------------------------|-------------:|--------------:|-------------:|--------------:|
@@ -640,37 +636,34 @@ K = 2 also passes the pass criterion but absorbs all of 2023 into
 binary near-ATH-vs-deep-drawdown split that loses the recovery
 nuance. K = 3 is the right K for this feature.
 
-Same rule-based ~BORDERLINE~ structure as Phase 0.5a: crit3 fails
-because Student-t and Gaussian fits are essentially identical (ν̂
-saturates at the upper bound 30 in every state), but the substantive
-verdict is PASS on the original Phase-0 question.
+Rule-based ~BORDERLINE~ on crit3 because Student-t and Gaussian fits
+are essentially identical (ν̂ saturates at the upper bound 30 in every
+state), but the substantive verdict is PASS on the regime-identification
+question.
 
 ** Why it works — root cause
 
-The Phase-0 negative-result writeup said: "regime structure the plan
-wants to detect lives at the cumulative-price level, not the per-day-
-return level". Phase 0.5a confirmed this with scaled log-price. Phase
-0.5b shows that drawdown from rolling max is a *strictly better* cumulative-
-level feature for this question, for three reasons:
+Drawdown from rolling max is a strong cumulative-level feature for
+regime detection because:
 
 1. *Causal by construction.* The running max uses only data up to t,
-   so there's no hindsight to defend. Phase 0.5a needed a robustness
-   check against the global z-score's lookahead; Phase 0.5b doesn't.
-2. *Bull state means what it says.* Under scaled log-price, "bull"
-   = "above the 2-year mean", which mislabels the 2023-H1 recovery
-   (price rising but still below mean → 41 % bear). Under drawdown,
-   "bull" = "near running ATH", and the recovery is correctly
-   ranging (price ~ 50 % off ATH and rising) — not bear.
+   so there's no hindsight in the observation — no rolling-window or
+   centred-z-score caveat to defend.
+2. *Bull state means what it says.* "Bull" = "near running ATH". The
+   2023-H1 recovery (price rising but still well below the cycle ATH)
+   correctly classifies as ranging — not bear, not bull. A
+   level-anchored feature like full-window z-scored log-price gets
+   this wrong: "bull" there means "above the window mean", which
+   penalises early recoveries.
 3. *Cleaner state separation.* In K = 3, the (μ, σ) for the three
    states form a near-evenly-spaced grid on the d_t axis (−1.21,
    −0.69, −0.13) with comparable σ across states. EM doesn't have
    to fight a single dominant distribution for variance share.
 
-The σ-saturation of ν at 30 confirms — for the second time — that
-heavy-tail emissions are unnecessary at this feature scale. Drawdown
-is bounded above (d_t ≤ 0) and varies on the order of σ = 0.1–0.2
-log-units; no observations are far enough from any state's μ to
-warrant Student-t tails.
+The saturation of ν at 30 confirms that heavy-tail emissions are
+unnecessary at this feature scale. Drawdown is bounded above (d_t ≤ 0)
+and varies on the order of σ = 0.1–0.2 log-units; no observations are
+far enough from any state's μ to warrant Student-t tails.
 
 ** Caveats
 
@@ -700,57 +693,66 @@ warrant Student-t tails.
    different days. The decomposition is conditional on the
    2021-06 → 2023-06 dynamics.
 
-** Comparison to Phase 0.5a (scaled log-price)
+** Implementation notes
 
-| Property                             | 0.5a scaled log-price | 0.5b drawdown |
-|--------------------------------------|-----------------------|---------------|
-| Hindsight in observation             | Yes (full-window μ,σ) | No (causal)   |
-| K = 3 2022 bear+ranging share        | 65 %                  | 100 %         |
-| K = 3 2022 bull contamination        | 35 %                  | 0 %           |
-| K = 3 2023-H1 dominant regime        | Ranging (correct dir) | Ranging (correct, with bear residue at cycle low) |
-| Best fit family                      | Gaussian (t collapses) | Gaussian (t collapses) |
-| Best K for this question             | 2 or 3                | 3             |
-| Real-time deployable                 | No, needs rolling z   | Yes           |
-
-Phase 0.5b is the better recipe in every column. Phase 0.5a is now
-mainly useful as a sanity-check ablation showing that the level
-feature also works — i.e. the result isn't an artefact of the
-specific drawdown transformation.
-
-** Implementation notes that survive
-
-Same code as Phase 0.5a, single-line change in data prep:
-~df["drawdown"] = df["log_price"] − df["log_price"].cummax()~. All of
-the forward-backward / Baum-Welch / Viterbi / restart machinery is
-unchanged. Conservation laws (LL monotone, ν within [3, 30],
-convergence within ~10 iterations for Gaussian) all hold.
+The whole observation transform is a single line:
+~df["drawdown"] = df["log_price"] − df["log_price"].cummax()~.
+Conservation laws hold throughout: LL monotone non-decreasing under
+EM, ν stays within [3, 30], Gaussian converges within ~10 iterations,
+Student-t within ~30.
 
 ** Recommended next direction
 
-Phase 0.5b is a real positive result and a defensible publishable
-finding standalone: "drawdown from rolling max is the right
-observation for HMM-based regime detection in BTC, and a K = 3
-Gaussian fit is sufficient". Two coherent rolls-forward:
+Standalone result: "drawdown from rolling max is the right observation
+for HMM-based regime detection in BTC, and a K = 3 Gaussian fit is
+sufficient". Three coherent rolls-forward, ranked by code reuse vs
+expected information gain:
 
-1. *Longer window, K = 4.* Per paper 3 (Koki 2020) the BTC daily-
-   return decomposition resolves to 4 states. With drawdown as the
-   observation, K = 4 might separate the bear into "approaching ATH
-   from below" vs "deep capitulation" sub-states, or split the
-   ranging state. Cheap (one-line K change); informative as a
-   sanity check that the K = 3 ceiling isn't an artefact of the
-   short window. Recommended next step.
+1. *Longer window, K = 4.* Koki, Leonardos & Piliouras (2020) find that
+   BTC daily-return regime structure resolves to 4 states (bear /
+   bull-high-vol / bull-low-vol / calm-auxiliary), with K = 3 being
+   structurally one short. With drawdown as the observation, K = 4
+   might separate the bear into "approaching ATH from below" vs "deep
+   capitulation" sub-states, or split the ranging state. Cheap
+   (one-line K change); informative as a sanity check that the K = 3
+   ceiling isn't an artefact of the short window. Recommended next.
 
 2. *Bivariate (drawdown, log-return).* Adds the per-day signal back
    in as a second channel. The latent state would now bind to both
    "where am I in the cycle" (drawdown) and "what's happening today"
-   (return), which is the natural extension toward paper 4's
-   multivariate setup. Needs a 2-D Gaussian M-step and a covariance
-   parameterisation choice (diagonal vs full). ~half day.
+   (return), which is the natural extension toward the multivariate
+   observation vector (return, realised volatility, volume) used by
+   Malekinezhad & Rafati (2026) on 4-hour BTC. Needs a 2-D Gaussian
+   M-step and a covariance parameterisation choice (diagonal vs
+   full). ~half day of code.
 
-3. *NH-HMM with VIX in transitions* (paper 3's recommendation).
-   Still on the table but lower marginal value now that the
-   homogeneous fit is so clean. Defer to Phase 1.
+3. *NH-HMM with VIX in transitions.* Koki et al. (2020) report VIX as
+   the universal transition predictor across BTC/ETH/XRP (posterior
+   inclusion probability 1.00), and Pakštaitė et al. (2025) confirm
+   the value of time-varying transitions in a Bayesian MCMC NH-HMM
+   on BTC daily log-price. Lower marginal value now that the
+   homogeneous fit is this clean, but the literature-aligned next
+   step beyond options 1–2.
 
-My recommendation: option 1 (K = 4 on drawdown, longer window if we
-extend the data). It's the smallest possible change from this passing
-recipe and answers the paper-3 structural question on our own data.
+My recommendation: option 1. It's the smallest possible change from
+this passing recipe and directly tests the Koki et al. (2020)
+structural claim on our own data and our own observation.
+
+** References
+
+- Shih, K.-S., Huang, P.-S., Hsu, C.-Y. (2024). /Bitcoin Cycle through
+  Markov Regime-Switching Model./ Weekly BTC, MS-AR(q), K = 2, with
+  VIX / USD as mean-equation covariates.
+- Pakštaitė, V. et al. (2025). /Bayesian MCMC HMM and NH-HMM for BTC
+  with macro covariates./ Daily log-price observation, K = 2,
+  Pólya–Gamma logistic transitions, MCMC covariate selection over 16
+  macro / BTC-specific predictors.
+- Koki, C., Leonardos, S., Piliouras, G. (2020). /Exploring the
+  predictability of cryptocurrencies via Bayesian hidden Markov
+  models./ Daily percentage log-returns on BTC/ETH/XRP, K = 4 NH-HMM,
+  Bayesian MCMC with Pólya–Gamma augmentation; VIX and 10Y Treasury
+  yield as dominant transition predictors.
+- Malekinezhad, M., Rafati, P. (2026). /NH-HMM on 4-hour BTC with
+  multivariate observation./ 4-hour BTC/USDT, observation vector
+  (log-return, realised volatility, normalised volume), K = 3 NH-HMM
+  with time-varying transitions.
