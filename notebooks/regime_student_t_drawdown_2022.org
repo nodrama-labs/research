@@ -583,6 +583,102 @@ for K in (2, 3):
 
 #+RESULTS:
 
+* Export dashboard feed
+
+Emit ~feed.json~ — the model output consumed by the public dashboard at
+~blog.nodrama.io/regimes~. The page is model-agnostic: it introspects
+~model.states[]~, so a different K / family / observation ships by re-running
+this cell and copying the file (~make publish~). Columnar series keep the
+artifact small; ~posterior~ is keyed by state name; ~viterbi~ ships as label
+strings. The drawdown colours below match the blog theme, not the matplotlib
+plots above.
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+import json
+
+# Light dashboard palette (matches blog regimes.css --rg-bear/ranging/bull).
+FEED_COLORS = {"bear": "#c0392b", "ranging": "#7f8694", "bull": "#27955f"}
+
+# Zoom windows surfaced on the dashboard (metadata only — the page slices the
+# series itself by these date ranges).
+FEED_WINDOWS = [
+    {"name": "2018_bear",    "label": "2018 bear",     "start": "2017-12-17", "end": "2018-12-15"},
+    {"name": "covid_2020",   "label": "COVID Q1 2020", "start": "2020-01-01", "end": "2020-04-30"},
+    {"name": "bull_2020_21", "label": "2020–21 bull",  "start": "2020-10-01", "end": "2021-11-10"},
+    {"name": "2022_bear",    "label": "2022 bear",     "start": "2021-11-10", "end": "2022-12-31"},
+]
+
+_K = 3
+_names = REGIME_NAMES[_K]
+_fit = fits[("gaussian", _K)]
+_order = orders[("gaussian", _K)]
+_post = posteriors[("gaussian", _K)]          # (T, K) canonical (bear..bull)
+_vit = viterbi_states[("gaussian", _K)]       # (T,) canonical state index
+_mu, _sigma = _fit.mu[_order], _fit.sigma[_order]
+_dates_s = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d").tolist()
+
+
+def _win_metrics(win):
+    mask = (df["date"] >= win["start"]) & (df["date"] <= win["end"])
+    idx = np.where(mask.to_numpy())[0]
+    if len(idx) == 0:
+        return {"viterbi_flips": 0, "n_days": 0,
+                "regime_shares": {n: 0.0 for n in _names}}
+    seg = _vit[idx]
+    return {
+        "viterbi_flips": int((np.diff(seg) != 0).sum()),
+        "n_days": int(len(idx)),
+        "regime_shares": {n: round(float((seg == i).mean()), 4)
+                          for i, n in enumerate(_names)},
+    }
+
+
+_A = np.exp(_fit.log_A)[np.ix_(_order, _order)]   # transition matrix, canonical
+
+feed = {
+    "generated_at": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT00:00:00Z"),
+    "asset": "BTCUSDT",
+    "frequency": "1d",
+    "model": {
+        "name": "drawdown-gaussian-k3",
+        "label": "Drawdown HMM — Gaussian, K=3",
+        "family": "gaussian",
+        "K": _K,
+        "observation": {"code": "drawdown_from_rolling_max",
+                        "label": "d_t = log(p_t) − max_{s≤t} log(p_s)"},
+        "fit_window": {"start": _dates_s[0], "end": _dates_s[-1]},
+        "log_likelihood": round(float(_fit.log_likelihood), 2),
+        "states": [
+            {"name": n, "color": FEED_COLORS[n],
+             "params": {"mu": round(float(_mu[i]), 4),
+                        "sigma": round(float(_sigma[i]), 4)}}
+            for i, n in enumerate(_names)
+        ],
+        "transition_matrix": [[round(float(v), 4) for v in row] for row in _A],
+    },
+    "series": {
+        "dates": _dates_s,
+        "close": [round(float(c), 2) for c in df["close"].to_numpy()],
+        "observation": [round(float(d), 5) for d in obs],
+        "posterior": {n: [round(float(p), 4) for p in _post[:, i]]
+                      for i, n in enumerate(_names)},
+        "viterbi": [_names[i] for i in _vit],
+    },
+    "windows": [{**w, "metrics": _win_metrics(w)} for w in FEED_WINDOWS],
+}
+
+# Written to the repo root; gitignored here, copied to the blog by `make publish`.
+_feed_path = os.path.join(HERE, "..", "feed.json")
+with open(_feed_path, "w", encoding="utf-8") as fh:
+    json.dump(feed, fh, separators=(",", ":"), ensure_ascii=False)
+print(f"wrote {os.path.abspath(_feed_path)} "
+      f"({os.path.getsize(_feed_path) / 1024:.0f} KB)")
+for s in feed["model"]["states"]:
+    print(f"  {s['name']:8s} {s['params']}")
+#+END_SRC
+
+#+RESULTS:
+
 * Positive result — writeup
 
 ** Hypothesis under test
