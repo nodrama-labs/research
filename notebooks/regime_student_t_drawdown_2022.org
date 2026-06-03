@@ -39,8 +39,8 @@ Risks:
 3. *Memory*. Rolling max is monotone non-decreasing, so consecutive
    d_t values are strongly serially correlated through the max.
    This violates the conditional independence assumption of the HMM
-   emission. Should not be fatal — most financial HMMs make the same
-   approximation — but worth flagging.
+   emission. Should not be fatal -- most financial HMMs make the same
+   approximation -- just flagging.
 
 * Setup
 
@@ -77,7 +77,7 @@ df["date"] = pd.to_datetime(df["date"])
 df = df.sort_values("date").reset_index(drop=True)
 df["log_return"] = np.log(df["close"]).diff()
 df["log_price"] = np.log(df["close"])
-# Drawdown from rolling max — causal (uses only history up to t).
+# Drawdown from rolling max -- causal (uses only history up to t).
 df["running_max_log_price"] = df["log_price"].cummax()
 df["drawdown"] = df["log_price"] - df["running_max_log_price"]
 
@@ -97,10 +97,10 @@ print(f"Days with d_t < -1.0 (~ -63% drawdown): {int((obs < -1.0).sum())} / {len
 
 #+RESULTS:
 
-* HMM core — shared forward-backward + Baum-Welch
+* HMM core -- shared forward-backward + Baum-Welch
 
 Standard log-space EM for HMMs with Gaussian or Student's-t emissions,
-plus a Viterbi decoder. Self-contained — no external HMM dependency.
+plus a Viterbi decoder. Self-contained -- no external HMM dependency.
 
 ** Forward-backward in log-space
 
@@ -366,7 +366,7 @@ for key, fit in fits.items():
 
 #+RESULTS:
 
-* Plots — full window + 2022 zoom
+* Plots -- full window + 2022 zoom
 
 #+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
 import matplotlib.pyplot as plt
@@ -408,7 +408,7 @@ for K in (2, 3):
                       if family == "student_t" else "")
         plot_regimes(axes[i], axes[i + 1], df["date"], df["close"],
                      posteriors[(family, K)], names,
-                     f"{family} K={K} on drawdown — BTCUSDT 2021-06 → 2023-06  {title_tail}")
+                     f"{family} K={K} on drawdown -- BTCUSDT 2021-06 → 2023-06  {title_tail}")
         i += 2
 plt.tight_layout()
 plt.show()
@@ -429,7 +429,7 @@ ax.plot(df["date"], obs, color="black", lw=0.8, label="drawdown d_t")
 ax.axhline(0, color="gray", lw=0.5, alpha=0.5)
 ax.axhline(-0.5, color="orange", lw=0.5, alpha=0.5, linestyle="--", label="-0.5 (~ -39%)")
 ax.axhline(-1.0, color="red", lw=0.5, alpha=0.5, linestyle="--", label="-1.0 (~ -63%)")
-ax.set_title("Drawdown from rolling max — BTCUSDT 2021-06 → 2023-06")
+ax.set_title("Drawdown from rolling max -- BTCUSDT 2021-06 → 2023-06")
 ax.set_ylabel("d_t = log(p_t) − max_{s≤t} log(p_s)")
 ax.legend(loc="lower right", fontsize=8)
 ax.grid(alpha=0.3)
@@ -458,7 +458,7 @@ for K in (2, 3):
         plot_regimes(axes[i], axes[i + 1],
                      df.loc[mask_2022, "date"], df.loc[mask_2022, "close"],
                      posteriors[(family, K)][idx_2022], names,
-                     f"{family} K={K} on drawdown — 2022 zoom")
+                     f"{family} K={K} on drawdown -- 2022 zoom")
         i += 2
 plt.tight_layout()
 plt.show()
@@ -466,7 +466,7 @@ plt.show()
 
 #+RESULTS:
 
-* Pass criterion — 2022 only
+* Pass criterion -- 2022 only
 
 Flip count from Viterbi for the primary metric, argmax-of-marginal as
 a sanity check. crit3 compares Student-t to Gaussian at the same K.
@@ -585,7 +585,7 @@ for K in (2, 3):
 
 * Export dashboard feed
 
-Emit ~feed.json~ — the model output consumed by the public dashboard at
+Emit ~feed.json~ -- the model output consumed by the public dashboard at
 ~blog.nodrama.io/regimes~. The page is model-agnostic: it introspects
 ~model.states[]~, so a different K / family / observation ships by re-running
 this cell and copying the file (~make publish~). Columnar series keep the
@@ -599,7 +599,7 @@ import json
 # Light dashboard palette (matches blog regimes.css --rg-bear/ranging/bull).
 FEED_COLORS = {"bear": "#c0392b", "ranging": "#7f8694", "bull": "#27955f"}
 
-# Zoom windows surfaced on the dashboard (metadata only — the page slices the
+# Zoom windows surfaced on the dashboard (metadata only -- the page slices the
 # series itself by these date ranges).
 FEED_WINDOWS = [
     {"name": "2018_bear",    "label": "2018 bear",     "start": "2017-12-17", "end": "2018-12-15"},
@@ -641,7 +641,7 @@ feed = {
     "frequency": "1d",
     "model": {
         "name": "drawdown-gaussian-k3",
-        "label": "Drawdown HMM — Gaussian, K=3",
+        "label": "Drawdown HMM -- Gaussian, K=3",
         "family": "gaussian",
         "K": _K,
         "observation": {"code": "drawdown_from_rolling_max",
@@ -679,12 +679,12 @@ for s in feed["model"]["states"]:
 
 #+RESULTS:
 
-* Positive result — writeup
+* Positive result -- writeup
 
 ** Hypothesis under test
 
-Whether *drawdown from rolling max* — a strictly causal observation
-that maps directly to the trader definition of a bear — produces a
+Whether *drawdown from rolling max* -- a strictly causal observation
+that maps directly to the trader definition of a bear -- produces a
 clean identification of 2022 as a sustained bear regime on the
 2021-06 → 2023-06 BTCUSDT window, with standard Gaussian / Student's-t
 HMM emissions at K ∈ {2, 3}.
@@ -708,8 +708,8 @@ small σ:
 | Regime  | μ̂       | σ̂      | Interpretation                                  |
 |---------|--------:|-------:|-------------------------------------------------|
 | bear    |  −1.21  |  0.12  | ~70 % off running ATH, tight cluster            |
-| ranging |  −0.69  |  0.20  | ~50 % off ATH, wider — local rallies / declines |
-| bull    |  −0.13  |  0.11  | ~12 % off ATH, tight — near running highs       |
+| ranging |  −0.69  |  0.20  | ~50 % off ATH, wider -- local rallies / declines |
+| bull    |  −0.13  |  0.11  | ~12 % off ATH, tight -- near running highs     |
 
 Per-window composition (K = 3 Gaussian), all four windows:
 
@@ -722,7 +722,7 @@ Per-window composition (K = 3 Gaussian), all four windows:
 
 Every window's composition matches the human label by eye:
 - The bull leg is 100 % bull.
-- 2022 is 100 % (bear + ranging) — no bull contamination.
+- 2022 is 100 % (bear + ranging) -- no bull contamination.
 - The 2023 recovery is dominantly ranging (price still well below
   ATH but rising off the cycle low), with the lingering bear-state
   presence reflecting Jan-Feb 2023 still being near the bottom.
@@ -737,17 +737,17 @@ are essentially identical (ν̂ saturates at the upper bound 30 in every
 state), but the substantive verdict is PASS on the regime-identification
 question.
 
-** Why it works — root cause
+** Why it works -- root cause
 
 Drawdown from rolling max is a strong cumulative-level feature for
 regime detection because:
 
 1. *Causal by construction.* The running max uses only data up to t,
-   so there's no hindsight in the observation — no rolling-window or
+   so there's no hindsight in the observation -- no rolling-window or
    centred-z-score caveat to defend.
 2. *Bull state means what it says.* "Bull" = "near running ATH". The
    2023-H1 recovery (price rising but still well below the cycle ATH)
-   correctly classifies as ranging — not bear, not bull. A
+   correctly classifies as ranging -- not bear, not bull. A
    level-anchored feature like full-window z-scored log-price gets
    this wrong: "bull" there means "above the window mean", which
    penalises early recoveries.
@@ -771,7 +771,7 @@ far enough from any state's μ to warrant Student-t tails.
    different window where d_t spends more time near 0 (a fresh bull
    making frequent new ATHs), this misspecification would inflate the
    σ of the bull state. A principled alternative is a truncated
-   Gaussian or a beta on −d_t — neither is necessary here.
+   Gaussian or a beta on −d_t -- neither is necessary here.
 2. *t = 0 boundary.* d_0 = 0 by construction, so the very first
    observation looks "bull" regardless of context. Immaterial: by
    day ~30 the running max has caught the cycle peak and the
