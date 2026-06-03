@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Drawdown HMM — BTC market regimes · regimes.nodrama.io</title>
+<meta name="description" content="A 3-state Hidden Markov Model on drawdown-from-rolling-max identifies bear / ranging / bull regimes in Bitcoin, 2017–present. Static-interactive research dashboard." />
+
+<meta property="og:title" content="Drawdown HMM — BTC market regimes" />
+<meta property="og:description" content="A 3-state HMM on drawdown-from-rolling-max identifies bear / ranging / bull regimes in Bitcoin, 2017–present." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://regimes.nodrama.io/" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400;1,9..144,500&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+
+<link rel="stylesheet" href="styles.css" />
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+
+<div class="wrap">
+
+  <!-- 1. HEADER ------------------------------------------------------------- -->
+  <header class="hero">
+    <div class="hero-eyebrow">
+      <span class="mono dot">●</span>
+      <span class="mono">regimes.nodrama.io</span>
+      <span class="mono sep">/</span>
+      <span class="mono">BTC market-regime model</span>
+    </div>
+
+    <h1 class="hero-title">
+      Bitcoin trades in <span class="ink-bear">bear</span>,
+      <span class="ink-ranging">ranging</span> &amp;
+      <span class="ink-bull">bull</span> regimes —
+      <span class="title-em">a hidden Markov model reads them off the drawdown.</span>
+    </h1>
+
+    <p class="hero-thesis">
+      Feed a 3-state HMM one strictly-causal number — how far price sits below its
+      running all-time high — and the latent states line up with what a trader
+      would call a bear, a chop, and a bull. No look-ahead, no hand-labelling.
+    </p>
+
+    <div class="hero-meta">
+      <div class="regime-now" id="regime-now"><!-- filled by app.js --></div>
+      <div class="meta-badges" id="meta-badges"><!-- filled by app.js --></div>
+    </div>
+
+    <nav class="hero-links mono">
+      <a href="feed.json" id="link-feed">feed.json ↗</a>
+      <a href="https://github.com/filipbielejec/trader-research-student-hmm" target="_blank" rel="noopener">repository ↗</a>
+      <a href="https://github.com/filipbielejec/trader-research-student-hmm/blob/main/notebooks/regime_student_t_drawdown_2022.org" target="_blank" rel="noopener">research notebook ↗</a>
+    </nav>
+  </header>
+
+  <!-- 2. HEADLINE FIGURE ---------------------------------------------------- -->
+  <section class="block">
+    <div class="block-head">
+      <span class="block-num mono">01</span>
+      <div>
+        <h2 class="block-title">The regime tape</h2>
+        <p class="block-sub">Log price over the model's posterior probability of each
+          regime. Where one color floods the lower panel, the model is confident.</p>
+      </div>
+    </div>
+    <div class="legend mono" id="legend"><!-- filled by app.js --></div>
+    <figure class="fig fig-tall"><div id="fig-headline"></div></figure>
+  </section>
+
+  <!-- 3. DIAGNOSTIC TRACE --------------------------------------------------- -->
+  <section class="block">
+    <div class="block-head">
+      <span class="block-num mono">02</span>
+      <div>
+        <h2 class="block-title">The observation</h2>
+        <p class="block-sub" id="diag-sub">The single feature the model sees.
+          Reference lines mark −0.5 (≈ −39% off the high) and −1.0 (≈ −63%).</p>
+      </div>
+    </div>
+    <figure class="fig"><div id="fig-diagnostic"></div></figure>
+  </section>
+
+  <!-- 4. ZOOM PANELS -------------------------------------------------------- -->
+  <section class="block">
+    <div class="block-head">
+      <span class="block-num mono">03</span>
+      <div>
+        <h2 class="block-title">Four episodes, same vocabulary</h2>
+        <p class="block-sub">The model never sees these labels — it reconstructs the
+          cycle's chapters from the drawdown alone.</p>
+      </div>
+    </div>
+    <div class="zoom-grid" id="zoom-grid"><!-- filled by app.js --></div>
+  </section>
+
+  <!-- 5. WINDOW SUMMARY TABLE ----------------------------------------------- -->
+  <section class="block">
+    <div class="block-head">
+      <span class="block-num mono">04</span>
+      <div>
+        <h2 class="block-title">Episode composition</h2>
+        <p class="block-sub">Share of each window the Viterbi path spends in each
+          regime, and how often it switches.</p>
+      </div>
+    </div>
+    <div class="table-wrap"><table class="data-table" id="window-table"></table></div>
+  </section>
+
+  <!-- 6. MODEL STATE PARAMETERS --------------------------------------------- -->
+  <section class="block">
+    <div class="block-head">
+      <span class="block-num mono">05</span>
+      <div>
+        <h2 class="block-title">The fitted states</h2>
+        <p class="block-sub">Emission parameters for each latent state, sorted by
+          mean drawdown. The transition matrix is what makes regimes sticky.</p>
+      </div>
+    </div>
+    <div class="params-layout">
+      <div class="table-wrap"><table class="data-table" id="state-table"></table></div>
+      <div class="table-wrap"><table class="data-table matrix" id="trans-table"></table></div>
+    </div>
+  </section>
+
+  <!-- 7. FOOTER ------------------------------------------------------------- -->
+  <footer class="foot">
+    <div class="foot-grid">
+      <div>
+        <h3 class="foot-h mono">Method</h3>
+        <p class="foot-p">
+          The observation is <span class="mono" id="foot-obs"></span>, a causal
+          drawdown from the running maximum of log price. A Gaussian HMM is fit by
+          Baum–Welch with five random restarts; states are named by ascending mean.
+          Student's-t emissions were tested and collapse to Gaussian at this feature
+          scale (ν saturates), so K=3 Gaussian is the shipped model. Everything on
+          this page is rendered from a single
+          <a href="feed.json">feed.json</a> — swap the file, ship a new model.
+        </p>
+      </div>
+      <div>
+        <h3 class="foot-h mono">Artifact</h3>
+        <p class="foot-p">
+          <a class="dl-btn mono" href="feed.json" download>↓ download feed.json</a>
+        </p>
+        <p class="foot-fine mono" id="foot-fine"></p>
+        <p class="foot-fine mono">Apache-2.0 · not financial advice</p>
+      </div>
+    </div>
+  </footer>
+
+</div>
+
+<!-- Model output, inlined at build time (scripts/build_feed.py). -->
+<script type="application/json" id="feed">{{FEED_JSON}}</script>
+<script src="app.js"></script>
+</body>
+</html>
