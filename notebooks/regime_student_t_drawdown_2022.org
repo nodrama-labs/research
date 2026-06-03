@@ -1,9 +1,6 @@
 * Description
 
-Phase 0.5b of the heavy-tail HMM track. Same recipe as Phase 0.5a
-([[file:regime_logprice_2022.org][regime_logprice_2022.org]]) — single-knob change to the observation
-feature — but using *drawdown from rolling max* instead of scaled
-log-price.
+Heavy-tail HMM track using *drawdown from rolling max*::
 
 Observation:
 
@@ -22,7 +19,7 @@ Properties:
 
 Window: 2021-06-01 → 2023-06-30. Asset: BTCUSDT daily.
 Models compared: Gaussian and Student's-t HMMs at K ∈ {2, 3}.
-Pass criterion: identical to Phase 0.5a — median bear-posterior over
+Pass criterion: median bear-posterior over
 2022 ≥ 0.6, flips ≤ 6, Student-t-vs-Gaussian gap ≥ 0.15 OR flip
 reduction ≥ 30 %.
 
