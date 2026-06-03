@@ -26,6 +26,9 @@ results/*.tsv
 !results/.gitkeep
 *.log
 
+# Dashboard feed produced by the notebook, committed in the blog repo.
+/feed.json
+
 # Local secrets
 .env
 .env.*
