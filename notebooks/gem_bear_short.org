@@ -1,0 +1,1462 @@
+#+TITLE: Aggressive Bear GEM (Short-Mode) POC
+#+AUTHOR: filip
+#+OPTIONS: toc:2 num:t
+
+* Description
+
+POC for an aggressive short-mode bear GEM model. Goal: validate whether
+ranking tokens by negative momentum and shorting the weakest beats both
+buy-and-hold and a naive equal-weight short of the same universe in
+2022's confirmed bear market.
+
+Window: May 1 - Dec 31, 2022 (matches gem_bear_models.org).
+Universe: 11 Binance USDⓈ-M perps mixing extreme fallers (SOL, AVAX,
+DOT, ADA), moderate fallers (BTC, ETH, LINK, MATIC), and
+outperformers (BNB, TRX, XMR). ADA was briefly excluded after an
+Oct 18-28, 2022 short-squeeze event drove a -11.7% drawdown on the
+best config; re-running without ADA cost ~15pp of return for only
+~1.4pp of DD relief, showing that ADA's earlier short (Oct 8-18,
++$2355) more than paid for the squeeze. ADA is therefore retained
+and the squeeze event is documented in the holdings annotation.
+
+Each stage reports PASS / NO-PASS on a single criterion. No combined
+verdict label - the three flags and the underlying numbers are meant
+to be read together, not collapsed into KILL / NO-PORT / PORT-TO-RUST.
+
+- Stage 1: best-config Calmar > naive equal-weight short Calmar?
+- Stage 2: best-config Calmar > long-only bear specialist (4.6)?
+- Stage 3: robust across configs? (>= 1/3 positive Calmar AND a
+  dominant fit_window in the top 6, model-agnostic)
+
+* Setup
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+import os, time, json
+import requests
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+from dataclasses import dataclass, field, replace
+from typing import Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+NOTEBOOK_DIR = os.path.expanduser("~/CloudStation/DevOps/fbielejec.github.io/notebooks")
+os.chdir(NOTEBOOK_DIR)
+
+TOKENS = ["BTCUSDT", "ETHUSDT", "LINKUSDT", "MATICUSDT", "ADAUSDT",
+          "DOTUSDT", "AVAXUSDT", "SOLUSDT", "BNBUSDT", "TRXUSDT", "XMRUSDT"]
+WINDOW_START = "2022-05-01"
+WINDOW_END   = "2022-12-31"
+INITIAL_CAPITAL = 10_000.0
+FEE_RATE = 0.003
+LONG_ONLY_BEAR_CALMAR = 4.6   # bear-w30 from gem_bear_models.org
+
+CANDLES_CSV = "bear_short_candles.csv"
+FUNDING_CSV = "bear_short_funding.csv"
+
+def ms(date_str: str) -> int:
+    return int(pd.Timestamp(date_str, tz="UTC").timestamp() * 1000)
+
+print(f"Universe: {len(TOKENS)} tokens, window {WINDOW_START} -> {WINDOW_END}")
+#+END_SRC
+
+#+RESULTS:
+: Universe: 11 tokens, window 2022-05-01 -> 2022-12-31
+
+* Data Fetch
+** Klines (Binance USDⓈ-M perpetual)
+
+Fetch klines:
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Fetch daily klines from Binance USDⓈ-M futures REST."""
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": symbol, "interval": "1d",
+        "startTime": start_ms, "endTime": end_ms, "limit": 1000,
+    }
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    rows = r.json()
+    df = pd.DataFrame(rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_vol", "trades", "tb_base", "tb_quote", "ignore",
+    ])
+    df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
+    df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = df[c].astype(float)
+    df["timestamp"] = df["timestamp"].astype(int)
+    df.insert(0, "token", symbol)
+    return df
+
+if os.path.exists(CANDLES_CSV):
+    candles_df = pd.read_csv(CANDLES_CSV)
+    candles_df = candles_df[candles_df["token"].isin(TOKENS)].reset_index(drop=True)
+    print(f"Loaded cached candles: {len(candles_df)} rows ({candles_df['token'].nunique()} tokens after filter)")
+else:
+    parts = []
+    for sym in TOKENS:
+        df = fetch_klines(sym, ms(WINDOW_START), ms(WINDOW_END))
+        print(f"  {sym}: {len(df)} candles")
+        parts.append(df)
+        time.sleep(0.2)   # be polite to the public endpoint
+    candles_df = pd.concat(parts, ignore_index=True)
+    candles_df.to_csv(CANDLES_CSV, index=False)
+    print(f"\nSaved {len(candles_df)} rows to {CANDLES_CSV}")
+#+END_SRC
+
+#+RESULTS:
+: Loaded cached candles: 2695 rows (11 tokens after filter)
+
+Klines sanity check:
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+candles_df["date"] = pd.to_datetime(candles_df["timestamp"], unit="ms")
+print(f"Date range: {candles_df['date'].min().date()} to {candles_df['date'].max().date()}\n")
+for token, g in candles_df.groupby("token"):
+    first_close = g.sort_values("timestamp").iloc[0]["close"]
+    last_close  = g.sort_values("timestamp").iloc[-1]["close"]
+    ret = (last_close - first_close) / first_close * 100
+    print(f"  {token:<10} {len(g):>4} candles  {first_close:>10.4f} -> {last_close:>10.4f}  ({ret:>+7.2f}%)")
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+  Date range: 2022-05-01 to 2022-12-31
+
+    ADAUSDT     245 candles      0.7887 ->     0.2456  ( -68.86%)
+    AVAXUSDT    245 candles     58.7000 ->    10.9030  ( -81.43%)
+    BNBUSDT     245 candles    389.6000 ->   246.1100  ( -36.83%)
+    BTCUSDT     245 candles  38440.5000 -> 16537.6000  ( -56.98%)
+    DOTUSDT     245 candles     15.3320 ->     4.3060  ( -71.91%)
+    ETHUSDT     245 candles   2823.3800 ->  1196.1000  ( -57.64%)
+    LINKUSDT    245 candles     11.2930 ->     5.5730  ( -50.65%)
+    MATICUSDT   245 candles      1.0985 ->     0.7580  ( -31.00%)
+    SOLUSDT     245 candles     89.6100 ->     9.9680  ( -88.88%)
+    TRXUSDT     245 candles      0.0708 ->     0.0545  ( -23.03%)
+    XMRUSDT     245 candles    211.7200 ->   147.2400  ( -30.46%)
+#+end_example
+
+** Funding rates (Binance USDⓈ-M, 8h cadence)
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def fetch_funding(symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Fetch historical 8h funding rates for one symbol."""
+    url = "https://fapi.binance.com/fapi/v1/fundingRate"
+    out = []
+    cursor = start_ms
+    while cursor < end_ms:
+        r = requests.get(url, params={
+            "symbol": symbol, "startTime": cursor, "endTime": end_ms, "limit": 1000,
+        }, timeout=10)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        out.extend(batch)
+        last_ts = int(batch[-1]["fundingTime"])
+        if last_ts <= cursor:
+            break
+        cursor = last_ts + 1
+        if len(batch) < 1000:
+            break
+    df = pd.DataFrame(out)
+    if df.empty:
+        return pd.DataFrame(columns=["token", "timestamp", "funding_rate"])
+    df["timestamp"] = df["fundingTime"].astype(int)
+    df["funding_rate"] = df["fundingRate"].astype(float)
+    df.insert(0, "token", symbol)
+    return df[["token", "timestamp", "funding_rate"]]
+
+if os.path.exists(FUNDING_CSV):
+    funding_df = pd.read_csv(FUNDING_CSV)
+    funding_df = funding_df[funding_df["token"].isin(TOKENS)].reset_index(drop=True)
+    print(f"Loaded cached funding: {len(funding_df)} rows ({funding_df['token'].nunique()} tokens after filter)")
+else:
+    parts = []
+    for sym in TOKENS:
+        df = fetch_funding(sym, ms(WINDOW_START), ms(WINDOW_END))
+        print(f"  {sym}: {len(df)} funding events")
+        parts.append(df)
+        time.sleep(0.2)
+    funding_df = pd.concat(parts, ignore_index=True)
+    funding_df.to_csv(FUNDING_CSV, index=False)
+    print(f"\nSaved {len(funding_df)} rows to {FUNDING_CSV}")
+#+END_SRC
+
+#+RESULTS:
+: Loaded cached funding: 8127 rows (11 tokens after filter)
+
+** Daily funding aggregation
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+funding_df["date"] = pd.to_datetime(funding_df["timestamp"], unit="ms").dt.floor("D")
+daily_funding = (
+    funding_df.groupby(["token", "date"])["funding_rate"]
+              .sum().reset_index()
+              .rename(columns={"funding_rate": "daily_funding_rate"})
+)
+daily_funding["date_ms"] = daily_funding["date"].astype("int64") // 10**6
+
+print(f"Daily funding rows: {len(daily_funding)}")
+print(f"\nPer-token mean daily funding rate (annualised):")
+for token, g in daily_funding.groupby("token"):
+    mean_daily = g["daily_funding_rate"].mean()
+    ann = mean_daily * 365 * 100
+    print(f"  {token:<10}  mean: {mean_daily*100:>7.4f}%/day   annualised: {ann:>+7.2f}%")
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+  Daily funding rows: 2684
+
+  Per-token mean daily funding rate (annualised):
+    ADAUSDT     mean: -0.0051%/day   annualised:   -1.86%
+    AVAXUSDT    mean: -0.0265%/day   annualised:   -9.66%
+    BNBUSDT     mean: -0.0364%/day   annualised:  -13.29%
+    BTCUSDT     mean:  0.0108%/day   annualised:   +3.93%
+    DOTUSDT     mean: -0.0450%/day   annualised:  -16.43%
+    ETHUSDT     mean: -0.0018%/day   annualised:   -0.66%
+    LINKUSDT    mean:  0.0119%/day   annualised:   +4.35%
+    MATICUSDT   mean: -0.0126%/day   annualised:   -4.59%
+    SOLUSDT     mean: -0.1587%/day   annualised:  -57.94%
+    TRXUSDT     mean: -0.0615%/day   annualised:  -22.46%
+    XMRUSDT     mean: -0.0156%/day   annualised:   -5.68%
+#+end_example
+
+* Core Functions
+** Statistics
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def r_squared(y: np.ndarray, y_hat: np.ndarray) -> float:
+    ss_total = np.sum((y - np.mean(y)) ** 2)
+    ss_residual = np.sum((y - y_hat) ** 2)
+    if ss_total < 1e-12:
+        return 0.0
+    return 1.0 - ss_residual / ss_total
+
+def average_true_range(close: np.ndarray, high: np.ndarray, low: np.ndarray) -> float:
+    n = len(close)
+    if n < 2:
+        return 0.0
+    tr_sum = 0.0
+    for i in range(1, n):
+        tr = max(
+            high[i] - low[i],
+            abs(high[i] - close[i - 1]),
+            abs(low[i] - close[i - 1]),
+        )
+        tr_sum += tr
+    return tr_sum / (n - 1)
+#+END_SRC
+
+#+RESULTS:
+
+** Regression Models
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def fit_linear_logspace(x, y):
+    ln_y = np.log(y)
+    X = np.column_stack([np.ones_like(x), x])
+    beta, *_ = np.linalg.lstsq(X, ln_y, rcond=None)
+    return beta[0], beta[1]
+
+def fit_linear_pricespace(x, y):
+    X = np.column_stack([np.ones_like(x), x])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    return beta[0], beta[1]
+
+def exponential_model(x, a0, a1):
+    return a0 * np.power(a1, x)
+
+def fit_exponential(x, y, initial):
+    try:
+        popt, _ = curve_fit(exponential_model, x, y, p0=initial, method='lm', maxfev=5000)
+        a0, a1 = popt
+        if np.isfinite(a0) and np.isfinite(a1):
+            return a0, a1
+    except (RuntimeError, ValueError):
+        pass
+    return initial
+#+END_SRC
+
+#+RESULTS:
+
+** Token Fitting
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+@dataclass
+class Position:
+    token: str
+    weight: float = 0.0
+    momentum: float = 0.0
+    r2: float = 0.0
+    a1: float = 0.0
+    atr: float = 0.0
+
+def fit_token_exponential(candles: pd.DataFrame, atr_window: int = 15, r2_exponent: float = 1.0):
+    if candles.empty:
+        return None
+    token = candles.iloc[0]["token"]
+    x = np.arange(len(candles), dtype=float)
+    closes = candles["close"].values
+    highs = candles["high"].values
+    lows = candles["low"].values
+    if np.any(closes <= 0):
+        return None
+    try:
+        b0, b1 = fit_linear_logspace(x, closes)
+    except Exception:
+        return None
+    initial = (np.exp(b0), np.exp(b1))
+    a0, a1 = fit_exponential(x, closes, initial)
+    y_hat = exponential_model(x, a0, a1)
+    r2 = r_squared(closes, y_hat)
+    momentum = (r2 ** r2_exponent) * (a1 - 1.0) * 100.0
+    lookback = min(len(candles), atr_window)
+    mean_close = np.mean(closes)
+    atr = (average_true_range(closes[-lookback:], highs[-lookback:], lows[-lookback:]) / mean_close
+           if lookback > 1 and mean_close > 0 else 0.0)
+    return Position(token=token, momentum=momentum, r2=r2, a1=a1, atr=atr)
+
+def fit_token_linear(candles: pd.DataFrame, atr_window: int = 15, r2_exponent: float = 1.0):
+    if candles.empty:
+        return None
+    token = candles.iloc[0]["token"]
+    x = np.arange(len(candles), dtype=float)
+    closes = candles["close"].values
+    highs = candles["high"].values
+    lows = candles["low"].values
+    try:
+        b0, b1 = fit_linear_pricespace(x, closes)
+    except Exception:
+        return None
+    y_hat = b0 + b1 * x
+    r2 = r_squared(closes, y_hat)
+    mean_close = np.mean(closes)
+    if mean_close <= 0:
+        return None
+    normalized_slope = b1 / mean_close
+    momentum = (r2 ** r2_exponent) * normalized_slope * 100.0
+    a1_equiv = 1.0 + normalized_slope
+    lookback = min(len(candles), atr_window)
+    atr = (average_true_range(closes[-lookback:], highs[-lookback:], lows[-lookback:]) / mean_close
+           if lookback > 1 and mean_close > 0 else 0.0)
+    return Position(token=token, momentum=momentum, r2=r2, a1=a1_equiv, atr=atr)
+#+END_SRC
+
+#+RESULTS:
+
+SOL-30d sanity check:
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+sol = candles_df[candles_df["token"] == "SOLUSDT"].sort_values("timestamp").reset_index(drop=True)
+sol_first_30 = sol.iloc[:30]
+p_exp = fit_token_exponential(sol_first_30)
+p_lin = fit_token_linear(sol_first_30)
+print(f"SOL first 30 days exp:  a1={p_exp.a1:.4f}  r2={p_exp.r2:.3f}  momentum={p_exp.momentum:+.3f}")
+print(f"SOL first 30 days lin:  a1={p_lin.a1:.4f}  r2={p_lin.r2:.3f}  momentum={p_lin.momentum:+.3f}")
+#+END_SRC
+
+#+RESULTS:
+: SOL first 30 days exp:  a1=0.9713  r2=0.819  momentum=-2.351
+: SOL first 30 days lin:  a1=0.9730  r2=0.760  momentum=-2.050
+
+* Short Mechanics
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+@dataclass
+class ShortPosition:
+    quantity: float      # positive units of base owed
+    entry_price: float
+
+@dataclass
+class DaySnapshot:
+    total_value: float
+    cash: float
+    position_pnl: float
+    cum_funding_pnl: float
+    positions: dict       # token -> current unrealised PnL
+
+class ShortPortfolioState:
+    def __init__(self, initial_capital: float):
+        self.cash = initial_capital
+        self.shorts: dict[str, ShortPosition] = {}
+        self.peak_value = initial_capital
+        self.cum_funding_pnl = 0.0
+        self.history: list[DaySnapshot] = []
+
+    def open_short(self, token: str, price: float, notional: float, fee_rate: float):
+        if notional <= 0 or price <= 0:
+            return
+        fee = notional * fee_rate
+        self.cash -= fee
+        qty = notional / price
+        if token in self.shorts:
+            existing = self.shorts[token]
+            new_qty = existing.quantity + qty
+            new_entry = (existing.entry_price * existing.quantity + price * qty) / new_qty
+            self.shorts[token] = ShortPosition(quantity=new_qty, entry_price=new_entry)
+        else:
+            self.shorts[token] = ShortPosition(quantity=qty, entry_price=price)
+
+    def close_short(self, token: str, price: float, quantity: float, fee_rate: float):
+        if token not in self.shorts:
+            return
+        pos = self.shorts[token]
+        qty = min(quantity, pos.quantity)
+        pnl = qty * (pos.entry_price - price)
+        notional = qty * price
+        fee = notional * fee_rate
+        self.cash += pnl - fee
+        pos.quantity -= qty
+        if pos.quantity <= 1e-12:
+            del self.shorts[token]
+
+    def apply_funding(self, prices: dict[str, float], daily_rates: dict[str, float]):
+        delta = 0.0
+        for token, pos in self.shorts.items():
+            price = prices.get(token, pos.entry_price)
+            rate = daily_rates.get(token, 0.0)
+            if not np.isfinite(rate):
+                rate = 0.0
+            payment = pos.quantity * price * rate
+            self.cash -= payment           # negative rate => cash up
+            delta -= payment
+        self.cum_funding_pnl += delta
+
+    def position_pnl(self, prices: dict[str, float]) -> float:
+        total = 0.0
+        for token, pos in self.shorts.items():
+            price = prices.get(token, pos.entry_price)
+            total += pos.quantity * (pos.entry_price - price)
+        return total
+
+    def total_value(self, prices: dict[str, float]) -> float:
+        return self.cash + self.position_pnl(prices)
+
+    def record_snapshot(self, prices: dict[str, float]):
+        total = self.total_value(prices)
+        self.peak_value = max(self.peak_value, total)
+        per_token = {
+            token: pos.quantity * (pos.entry_price - prices.get(token, pos.entry_price))
+            for token, pos in self.shorts.items()
+        }
+        self.history.append(DaySnapshot(
+            total_value=total, cash=self.cash,
+            position_pnl=self.position_pnl(prices),
+            cum_funding_pnl=self.cum_funding_pnl, positions=per_token,
+        ))
+#+END_SRC
+
+#+RESULTS:
+
+Sanity check:
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+state = ShortPortfolioState(10_000.0)
+state.open_short("SOLUSDT", price=80.0, notional=5_000.0, fee_rate=0.003)
+# Sanity: 5000/80 = 62.5 units, fee = 15
+assert abs(state.shorts["SOLUSDT"].quantity - 62.5) < 1e-9
+assert abs(state.cash - (10_000 - 15)) < 1e-9
+# Price falls to 40 (a 50% drop) -> PnL = 62.5 * (80-40) = 2500
+pnl = state.position_pnl({"SOLUSDT": 40.0})
+assert abs(pnl - 2500.0) < 1e-9
+# Funding settlement at -0.0001 daily on $40 * 62.5 = $2500 notional => +$0.25 to cash
+pre = state.cash
+state.apply_funding({"SOLUSDT": 40.0}, {"SOLUSDT": -0.0001})
+assert abs(state.cash - (pre + 0.25)) < 1e-9
+# Close half: 31.25 units at price 40 => realised = 31.25*(80-40)=1250, fee=31.25*40*0.003=3.75
+state.close_short("SOLUSDT", price=40.0, quantity=31.25, fee_rate=0.003)
+assert abs(state.shorts["SOLUSDT"].quantity - 31.25) < 1e-9
+print("ShortPortfolioState sanity check: OK")
+print(f"  cash={state.cash:.4f}  remaining_qty={state.shorts['SOLUSDT'].quantity}  cum_funding={state.cum_funding_pnl:.4f}")
+#+END_SRC
+
+#+RESULTS:
+: ShortPortfolioState sanity check: OK
+:   cash=11231.5000  remaining_qty=31.25  cum_funding=0.2500
+
+* Portfolio Construction
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+@dataclass
+class GemShortParams:
+    r2_threshold: float = 0.5
+    momentum_floor: float = 0.02         # require momentum < -momentum_floor
+    top_n: int = 3
+    fit_window: int = 30
+    atr_window: int = 15
+    r2_exponent: float = 2.0
+    initial_capital: float = 10_000.0
+    fee_rate: float = 0.003
+    rebalance_cooldown: int = 10
+
+def build_short_portfolio(candidates: list[Position], params: GemShortParams) -> list[Position]:
+    filtered = [
+        p for p in candidates
+        if p.a1 < 1.0
+        and p.r2 > params.r2_threshold
+        and p.momentum < -params.momentum_floor
+        and p.atr > 0.0
+    ]
+    filtered.sort(key=lambda p: p.momentum)             # ascending -> most negative first
+    filtered = filtered[:params.top_n]
+    if not filtered:
+        return []
+    mag_sum = sum(abs(p.momentum) for p in filtered)
+    if mag_sum <= 0:
+        return []
+    for p in filtered:
+        p.weight = abs(p.momentum) / mag_sum
+    return filtered
+#+END_SRC
+
+#+RESULTS:
+
+sanity check:
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+toy = [
+    Position(token="SOL",  momentum=-0.30, r2=0.85, a1=0.95, atr=0.05),
+    Position(token="AVAX", momentum=-0.25, r2=0.80, a1=0.96, atr=0.04),
+    Position(token="DOT",  momentum=-0.15, r2=0.70, a1=0.97, atr=0.03),
+    Position(token="BTC",  momentum=-0.08, r2=0.60, a1=0.98, atr=0.02),
+    Position(token="TRX",  momentum=+0.02, r2=0.40, a1=1.01, atr=0.01),    # outperformer
+    Position(token="BNB",  momentum=-0.01, r2=0.30, a1=0.999, atr=0.02),   # fails r2 + floor
+]
+params = GemShortParams(top_n=3)
+picked = build_short_portfolio(toy, params)
+assert [p.token for p in picked] == ["SOL", "AVAX", "DOT"]
+assert abs(sum(p.weight for p in picked) - 1.0) < 1e-9
+assert picked[0].weight > picked[1].weight > picked[2].weight   # mag-weighted, SOL biggest
+print("build_short_portfolio sanity check: OK")
+for p in picked:
+    print(f"  {p.token}: weight={p.weight:.4f}  momentum={p.momentum}")
+#+END_SRC
+
+#+RESULTS:
+: build_short_portfolio sanity check: OK
+:   SOL: weight=0.4286  momentum=-0.3
+:   AVAX: weight=0.3571  momentum=-0.25
+:   DOT: weight=0.2143  momentum=-0.15
+
+* Rebalancing
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def is_in_cooldown(current_day, last_rebalance_day, cooldown_days):
+    if last_rebalance_day is None:
+        return False
+    return cooldown_days > 0 and (current_day - last_rebalance_day) < cooldown_days
+
+def should_rebalance_short(current_shorts: dict[str, float], momentums: dict[str, float],
+                           entry_threshold: float, exit_threshold: float) -> bool:
+    """
+    entry_threshold: e.g. -0.02 (enter when momentum crosses below)
+    exit_threshold:  e.g. -0.02 (exit when momentum crosses back above)
+    """
+    for token, m in momentums.items():
+        is_held = token in current_shorts
+        if not is_held and m < entry_threshold:
+            return True
+        if is_held and m > exit_threshold:
+            return True
+    return False
+
+def rebalance_shorts_to_targets(state: ShortPortfolioState,
+                                target_weights: dict[str, float],
+                                prices: dict[str, float],
+                                fee_rate: float):
+    """Differential rebalance: close removed/overweight shorts; open new/underweight shorts."""
+    total = state.total_value(prices)
+    if total <= 0:
+        return
+    min_trade = total * 0.001
+
+    # Close anything not in target (or oversized)
+    for token in list(state.shorts.keys()):
+        price = prices.get(token, state.shorts[token].entry_price)
+        current_notional = state.shorts[token].quantity * price
+        target_notional = target_weights.get(token, 0.0) * total
+        excess = current_notional - target_notional
+        if excess > min_trade:
+            qty_to_close = excess / price
+            state.close_short(token, price, qty_to_close, fee_rate)
+
+    # Re-evaluate total (closes may have moved cash)
+    total = state.total_value(prices)
+
+    # Open new or underweight shorts
+    for token, w in target_weights.items():
+        price = prices.get(token)
+        if price is None or price <= 0:
+            continue
+        target_notional = total * w
+        current_notional = (state.shorts[token].quantity * price
+                            if token in state.shorts else 0.0)
+        gap = target_notional - current_notional
+        if gap > min_trade:
+            state.open_short(token, price, gap, fee_rate)
+#+END_SRC
+
+#+RESULTS:
+
+sanity check:
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+# Build a state with two open shorts, rebalance to a target that drops one and resizes another.
+s = ShortPortfolioState(10_000.0)
+s.open_short("SOLUSDT", 80.0, 4_000.0, 0.003)
+s.open_short("AVAXUSDT", 40.0, 2_000.0, 0.003)
+prices = {"SOLUSDT": 80.0, "AVAXUSDT": 40.0}
+print(f"Before: shorts={list(s.shorts.keys())}  notionals={{SOL: {s.shorts['SOLUSDT'].quantity*80:.1f}, AVAX: {s.shorts['AVAXUSDT'].quantity*40:.1f}}}")
+# Target: keep SOL at 50%, drop AVAX entirely
+rebalance_shorts_to_targets(s, {"SOLUSDT": 0.5}, prices, 0.003)
+print(f"After:  shorts={list(s.shorts.keys())}")
+assert "AVAXUSDT" not in s.shorts
+sol_notional = s.shorts["SOLUSDT"].quantity * 80
+assert abs(sol_notional - s.total_value(prices) * 0.5) < s.total_value(prices) * 0.01
+print("rebalance sanity check: OK")
+#+END_SRC
+
+#+RESULTS:
+: Before: shorts=['SOLUSDT', 'AVAXUSDT']  notionals={SOL: 4000.0, AVAX: 2000.0}
+: After:  shorts=['SOLUSDT']
+: rebalance sanity check: OK
+
+* GEM Short Backtest
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def gem_short_backtest(params: GemShortParams,
+                       candles_by_token: dict[str, pd.DataFrame],
+                       funding_by_token: dict[str, dict[int, float]],
+                       fit_fn) -> dict:
+    all_timestamps = sorted(set(
+        ts for c in candles_by_token.values() for ts in c["timestamp"].values
+    ))
+    if not all_timestamps:
+        return _empty_metrics()
+
+    price_index = {
+        token: dict(zip(c["timestamp"].values, c["close"].values))
+        for token, c in candles_by_token.items()
+    }
+
+    state = ShortPortfolioState(params.initial_capital)
+    rebalance_count = 0
+    last_rebalance_day = None
+
+    for day_idx, ts in enumerate(all_timestamps):
+        prices = {tk: pm[ts] for tk, pm in price_index.items() if ts in pm}
+        day_date = pd.Timestamp(ts, unit="ms").floor("D")
+        day_ms = int(day_date.value // 10**6)
+        daily_rates = {tk: funding_by_token.get(tk, {}).get(day_ms, 0.0) for tk in price_index}
+
+        # 1. Apply funding to currently-open shorts before any decisions
+        state.apply_funding(prices, daily_rates)
+
+        # 2. Fit each token using up-to-current candles, trimmed to fit_window
+        fit_results = {}
+        for token, candles in candles_by_token.items():
+            up_to = candles[candles["timestamp"] <= ts]
+            if params.fit_window > 0 and len(up_to) > params.fit_window:
+                up_to = up_to.iloc[-params.fit_window:]
+            if len(up_to) >= 2:
+                pos = fit_fn(up_to, params.atr_window, params.r2_exponent)
+                if pos is not None:
+                    fit_results[token] = pos
+
+        # 3. Rebalance decision
+        need_rebalance = False
+        if day_idx == 0:
+            need_rebalance = True
+        elif not is_in_cooldown(day_idx, last_rebalance_day, params.rebalance_cooldown):
+            momentums = {t: p.momentum for t, p in fit_results.items()}
+            holdings = {t: pos.quantity for t, pos in state.shorts.items()}
+            need_rebalance = should_rebalance_short(
+                holdings, momentums,
+                entry_threshold=-params.momentum_floor,
+                exit_threshold=-params.momentum_floor,
+            )
+
+        if need_rebalance:
+            portfolio = build_short_portfolio(list(fit_results.values()), params)
+            target_weights = {p.token: p.weight for p in portfolio}
+            rebalance_shorts_to_targets(state, target_weights, prices, params.fee_rate)
+            rebalance_count += 1
+            last_rebalance_day = day_idx
+
+        state.record_snapshot(prices)
+
+    return _compute_metrics(state, rebalance_count, all_timestamps)
+#+END_SRC
+
+#+RESULTS:
+
+* Metrics
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def _empty_metrics():
+    return dict(total_return_pct=0.0, annualized_return_pct=0.0, max_drawdown_pct=0.0,
+                sharpe_ratio=0.0, sortino_ratio=0.0, calmar_ratio=0.0,
+                rebalance_count=0, win_rate_pct=0.0, final_value=0.0,
+                price_return_pct=0.0, funding_return_pct=0.0, equity_curve=[])
+
+def _compute_metrics(state: ShortPortfolioState, rebalance_count: int, timestamps: list) -> dict:
+    history = state.history
+    if len(history) < 2:
+        return _empty_metrics()
+    values = np.array([s.total_value for s in history])
+    initial_value = values[0] if values[0] > 0 else INITIAL_CAPITAL
+    final_value = values[-1]
+    total_return = (final_value - initial_value) / initial_value
+    days = len(history)
+    years = days / 365.0
+    annualized_return = (1.0 + total_return) ** (1.0 / years) - 1.0 if 1.0 + total_return > 0 else -1.0
+    peak = np.maximum.accumulate(values)
+    drawdowns = np.where(peak > 0, (peak - values) / peak, 0.0)
+    max_drawdown = float(np.max(drawdowns))
+    daily_returns = np.diff(values) / values[:-1]
+    mean_r = np.mean(daily_returns)
+    std_r = np.std(daily_returns)
+    sharpe = (mean_r / std_r * np.sqrt(252)) if std_r > 1e-12 else 0.0
+    downside = daily_returns[daily_returns < 0]
+    downside_dev = (np.sqrt(np.sum(downside ** 2) / len(daily_returns))
+                    if len(daily_returns) > 0 else 0.0)
+    sortino = (mean_r / downside_dev * np.sqrt(252)) if downside_dev > 1e-12 else 0.0
+    calmar = (annualized_return / max_drawdown) if max_drawdown > 1e-12 else 0.0
+    monthly_returns = []
+    chunk = min(30, len(values))
+    for i in range(0, len(values), chunk):
+        c = values[i:i+chunk]
+        if len(c) > 1:
+            monthly_returns.append((c[-1] - c[0]) / c[0])
+    win_rate = (sum(1 for r in monthly_returns if r > 0) / len(monthly_returns) * 100
+                if monthly_returns else 0.0)
+    funding_return = state.cum_funding_pnl / initial_value * 100
+    price_return = total_return * 100 - funding_return
+    dates = pd.to_datetime(np.array(timestamps[:len(values)]), unit="ms")
+    return dict(
+        total_return_pct=total_return*100, annualized_return_pct=annualized_return*100,
+        max_drawdown_pct=-max_drawdown*100, sharpe_ratio=sharpe, sortino_ratio=sortino,
+        calmar_ratio=calmar, rebalance_count=rebalance_count, win_rate_pct=win_rate,
+        final_value=final_value,
+        price_return_pct=price_return, funding_return_pct=funding_return,
+        equity_curve=list(zip(dates, values)),
+    )
+
+def print_metrics(label, m):
+    print(f"\n{'='*60}\n  {label}\n{'='*60}")
+    print(f"  Total return:      {m['total_return_pct']:>8.2f}%")
+    print(f"    of which price:  {m['price_return_pct']:>8.2f}%")
+    print(f"    of which fund.:  {m['funding_return_pct']:>8.2f}%")
+    print(f"  Annualised:        {m['annualized_return_pct']:>8.2f}%")
+    print(f"  Max drawdown:      {m['max_drawdown_pct']:>8.2f}%")
+    print(f"  Sharpe:            {m['sharpe_ratio']:>8.3f}")
+    print(f"  Sortino:           {m['sortino_ratio']:>8.3f}")
+    print(f"  Calmar:            {m['calmar_ratio']:>8.3f}")
+    print(f"  Rebalances:        {m['rebalance_count']:>8d}")
+    print(f"  Win rate (mo):     {m['win_rate_pct']:>8.1f}%")
+    print(f"  Final value:    $  {m['final_value']:>10.2f}")
+#+END_SRC
+
+#+RESULTS:
+
+Smoke test:
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+candles_by_token = {
+    tok: g.sort_values("timestamp").reset_index(drop=True)
+    for tok, g in candles_df.groupby("token")
+}
+funding_by_token = {
+    tok: dict(zip(g["date_ms"], g["daily_funding_rate"]))
+    for tok, g in daily_funding.groupby("token")
+}
+res = gem_short_backtest(GemShortParams(top_n=3, fit_window=30),
+                         candles_by_token, funding_by_token, fit_token_exponential)
+print_metrics("smoke: exp-n3-w30", res)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+
+  ============================================================
+    smoke: exp-n3-w30
+  ============================================================
+    Total return:         41.67%
+      of which price:     37.05%
+      of which fund.:      4.63%
+    Annualised:           68.03%
+    Max drawdown:        -25.52%
+    Sharpe:               0.909
+    Sortino:              1.465
+    Calmar:               2.666
+    Rebalances:              21
+    Win rate (mo):         66.7%
+    Final value:    $    14167.15
+#+end_example
+
+* IN-PROGRESS Sweep
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+fit_windows  = [15, 30, 60, 90]
+top_n_values = [1, 3, 5, 8]
+model_fns    = {"exp": fit_token_exponential, "lin": fit_token_linear}
+
+sweep_results = {}
+for w in fit_windows:
+    for n in top_n_values:
+        for mname, fn in model_fns.items():
+            label = f"{mname}-n{n}-w{w}"
+            p = GemShortParams(top_n=n, fit_window=w)
+            sweep_results[label] = gem_short_backtest(p, candles_by_token, funding_by_token, fn)
+
+# Summary table sorted by Calmar
+rows = []
+for label, m in sweep_results.items():
+    rows.append((label, m["total_return_pct"], m["max_drawdown_pct"],
+                 m["calmar_ratio"], m["sharpe_ratio"], m["rebalance_count"]))
+rows.sort(key=lambda r: r[3], reverse=True)
+print(f"{'config':<14}{'return%':>10}{'maxDD%':>10}{'Calmar':>10}{'Sharpe':>10}{'rebal':>8}")
+print("-"*62)
+for r in rows:
+    print(f"{r[0]:<14}{r[1]:>10.2f}{r[2]:>10.2f}{r[3]:>10.3f}{r[4]:>10.3f}{r[5]:>8d}")
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+  config           return%    maxDD%    Calmar    Sharpe   rebal
+  --------------------------------------------------------------
+  lin-n1-w15         87.24    -27.41     5.641     1.391      22
+  exp-n1-w15         84.31    -27.41     5.424     1.363      22
+  exp-n8-w15         62.46    -24.62     4.308     1.226      22
+  lin-n8-w15         61.78    -24.59     4.260     1.220      22
+  exp-n5-w15         58.93    -24.89     3.994     1.154      22
+  lin-n5-w15         57.69    -24.88     3.903     1.141      22
+  lin-n3-w30         50.45    -25.62     3.269     1.014      21
+  lin-n3-w15         50.97    -26.98     3.141     1.021      22
+  exp-n3-w15         50.93    -26.99     3.136     1.024      22
+  lin-n1-w30         57.42    -31.73     3.045     1.058      21
+  exp-n3-w30         41.67    -25.52     2.666     0.909      21
+  exp-n1-w30         48.84    -31.73     2.548     0.962      21
+  lin-n3-w60         39.88    -47.28     1.372     0.851      22
+  exp-n8-w30         20.74    -24.78     1.308     0.632      21
+  lin-n8-w30         20.54    -24.68     1.301     0.629      21
+  exp-n1-w90         43.89    -58.47     1.231     0.872      22
+  exp-n5-w30         20.99    -27.73     1.184     0.630      21
+  lin-n5-w30         20.89    -27.87     1.172     0.628      21
+  lin-n5-w60         32.77    -46.33     1.134     0.780      22
+  lin-n1-w60         36.09    -51.45     1.133     0.805      22
+  lin-n8-w60         30.15    -45.49     1.057     0.751      22
+  exp-n5-w90         31.90    -50.33     1.015     0.760      21
+  lin-n5-w90         23.74    -52.89     0.706     0.662      21
+  lin-n3-w90         21.41    -54.13     0.619     0.636      22
+  exp-n5-w60         20.13    -51.09     0.615     0.617      22
+  exp-n8-w90         19.36    -50.85     0.593     0.606      21
+  lin-n8-w90         19.89    -52.56     0.590     0.612      21
+  exp-n8-w60         18.51    -50.03     0.575     0.593      22
+  exp-n3-w60         17.58    -54.49     0.501     0.591      22
+  exp-n3-w90         14.21    -56.62     0.387     0.555      22
+  lin-n1-w90         13.41    -65.19     0.316     0.561      22
+  exp-n1-w60          9.64    -60.31     0.244     0.522      22
+#+end_example
+
+* Baselines
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+def buy_and_hold(candles_by_token, initial_capital=INITIAL_CAPITAL, fee_rate=FEE_RATE):
+    """Equal-weight long across all tokens, held start-to-finish."""
+    timestamps = sorted(set(ts for c in candles_by_token.values() for ts in c["timestamp"].values))
+    price_index = {t: dict(zip(c["timestamp"].values, c["close"].values))
+                   for t, c in candles_by_token.items()}
+    tokens = [t for t in candles_by_token if timestamps[0] in price_index[t]]
+    w = 1.0 / len(tokens)
+    # Open positions on day 0 - track unitwise
+    units = {}
+    cash = initial_capital
+    for t in tokens:
+        notional = initial_capital * w
+        fee = notional * fee_rate
+        cash -= notional + fee
+        units[t] = notional / price_index[t][timestamps[0]]
+    history = []
+    cum_funding = 0.0
+    for ts in timestamps:
+        equity = cash + sum(units[t] * price_index[t].get(ts, 0.0) for t in tokens)
+        history.append(DaySnapshot(total_value=equity, cash=cash,
+                                   position_pnl=equity-cash, cum_funding_pnl=0.0,
+                                   positions={}))
+    state = ShortPortfolioState(initial_capital)
+    state.history = history
+    return _compute_metrics(state, 0, timestamps)
+
+def naive_equal_weight_short(candles_by_token, funding_by_token,
+                             initial_capital=INITIAL_CAPITAL, fee_rate=FEE_RATE):
+    """Equal-weight short across all tokens on day 0, never rebalanced. With funding."""
+    timestamps = sorted(set(ts for c in candles_by_token.values() for ts in c["timestamp"].values))
+    price_index = {t: dict(zip(c["timestamp"].values, c["close"].values))
+                   for t, c in candles_by_token.items()}
+    tokens = [t for t in candles_by_token if timestamps[0] in price_index[t]]
+    state = ShortPortfolioState(initial_capital)
+    w = 1.0 / len(tokens)
+    prices0 = {t: price_index[t][timestamps[0]] for t in tokens}
+    for t in tokens:
+        state.open_short(t, prices0[t], initial_capital * w, fee_rate)
+    for ts in timestamps:
+        prices = {t: price_index[t].get(ts, state.shorts[t].entry_price if t in state.shorts else 0)
+                  for t in tokens}
+        day_date = pd.Timestamp(ts, unit="ms").floor("D")
+        day_ms = int(day_date.value // 10**6)
+        daily_rates = {t: funding_by_token.get(t, {}).get(day_ms, 0.0) for t in tokens}
+        state.apply_funding(prices, daily_rates)
+        state.record_snapshot(prices)
+    return _compute_metrics(state, 1, timestamps)
+
+bh = buy_and_hold(candles_by_token)
+naive = naive_equal_weight_short(candles_by_token, funding_by_token)
+print_metrics(f"Buy & Hold ({len(TOKENS)}-token equal-weight long)", bh)
+print_metrics(f"Naive equal-weight short ({len(TOKENS)} tokens)", naive)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+
+  ============================================================
+    Buy & Hold (11-token equal-weight long)
+  ============================================================
+    Total return:        -54.50%
+      of which price:    -54.50%
+      of which fund.:      0.00%
+    Annualised:          -69.06%
+    Max drawdown:        -58.11%
+    Sharpe:              -0.850
+    Sortino:             -1.098
+    Calmar:              -1.188
+    Rebalances:               0
+    Win rate (mo):         22.2%
+    Final value:    $     4536.78
+
+  ============================================================
+    Naive equal-weight short (11 tokens)
+  ============================================================
+    Total return:         57.72%
+      of which price:     54.43%
+      of which fund.:      3.29%
+    Annualised:           97.15%
+    Max drawdown:        -16.41%
+    Sharpe:               1.481
+    Sortino:              2.752
+    Calmar:               5.920
+    Rebalances:               1
+    Win rate (mo):         77.8%
+    Final value:    $    15731.21
+#+end_example
+
+* Plots
+** Equity curves: all sweep configs + baselines
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots(figsize=(12, 6))
+for label, m in sweep_results.items():
+    if not m["equity_curve"]:
+        continue
+    dates, vals = zip(*m["equity_curve"])
+    ax.plot(dates, vals, lw=0.6, alpha=0.5, color="grey")
+# Baselines on top
+for label, m, color in [("Buy & Hold", bh, "steelblue"),
+                        ("Naive short", naive, "darkorange")]:
+    if m["equity_curve"]:
+        dates, vals = zip(*m["equity_curve"])
+        ax.plot(dates, vals, lw=2.0, label=label, color=color)
+# Highlight best Calmar config
+best_label = max(sweep_results, key=lambda k: sweep_results[k]["calmar_ratio"])
+bm = sweep_results[best_label]
+dates, vals = zip(*bm["equity_curve"])
+ax.plot(dates, vals, lw=2.0, color="crimson", label=f"Best: {best_label}")
+ax.axhline(INITIAL_CAPITAL, color="black", lw=0.5, ls="--")
+ax.set_title(f"Short-mode POC: equity curves ({len(sweep_results)} configs vs baselines)")
+ax.set_ylabel("Equity ($)")
+ax.legend()
+plt.tight_layout()
+out_dir = "../images/2026-05-15-aggressive-bear-short-gem"
+os.makedirs(out_dir, exist_ok=True)
+plt.savefig(f"{out_dir}/equity_curves.png", dpi=140, bbox_inches="tight")
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+[[file:./.ob-jupyter/9e36ec222ebbf15ffde41e6858f6c82c047f390d.png]]
+
+** Holdings trace for best config
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+# Re-run the best config but inline-trace rebalance decisions
+best_label = max(sweep_results, key=lambda k: sweep_results[k]["calmar_ratio"])
+mname, n_str, w_str = best_label.split("-")
+n = int(n_str[1:]); w = int(w_str[1:])
+fit_fn = model_fns[mname]
+p = GemShortParams(top_n=n, fit_window=w)
+
+timestamps = sorted(set(ts for c in candles_by_token.values() for ts in c["timestamp"].values))
+state = ShortPortfolioState(p.initial_capital)
+last_reb = None
+print(f"{'day':>4} {'date':<11} {'action':<8} {'held':<32} {'value':>10}")
+print("-"*70)
+for day_idx, ts in enumerate(timestamps):
+    prices = {t: candles_by_token[t][candles_by_token[t]['timestamp']==ts]['close'].values[0]
+              for t in candles_by_token
+              if (candles_by_token[t]['timestamp']==ts).any()}
+    day_ms = int(pd.Timestamp(ts, unit="ms").floor("D").value // 10**6)
+    daily_rates = {t: funding_by_token.get(t, {}).get(day_ms, 0.0) for t in candles_by_token}
+    state.apply_funding(prices, daily_rates)
+    fit_results = {}
+    for t, c in candles_by_token.items():
+        up_to = c[c["timestamp"] <= ts]
+        if p.fit_window and len(up_to) > p.fit_window:
+            up_to = up_to.iloc[-p.fit_window:]
+        if len(up_to) >= 2:
+            pos = fit_fn(up_to, p.atr_window, p.r2_exponent)
+            if pos is not None:
+                fit_results[t] = pos
+    need = day_idx == 0 or (not is_in_cooldown(day_idx, last_reb, p.rebalance_cooldown)
+                            and should_rebalance_short(
+                                {t: s.quantity for t, s in state.shorts.items()},
+                                {t: pp.momentum for t, pp in fit_results.items()},
+                                -p.momentum_floor, -p.momentum_floor))
+    if need:
+        portfolio = build_short_portfolio(list(fit_results.values()), p)
+        targets = {pp.token: pp.weight for pp in portfolio}
+        rebalance_shorts_to_targets(state, targets, prices, p.fee_rate)
+        last_reb = day_idx
+        held = ", ".join(state.shorts.keys()) or "CASH"
+        date_str = pd.Timestamp(ts, unit="ms").strftime("%Y-%m-%d")
+        print(f"{day_idx:>4} {date_str:<11} {'REBAL':<8} {held:<32} {state.total_value(prices):>10.2f}")
+    state.record_snapshot(prices)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+   day date        action   held                                  value
+  ----------------------------------------------------------------------
+     0 2022-05-01  REBAL    CASH                               10000.00
+    10 2022-05-11  REBAL    SOLUSDT                             9970.00
+    20 2022-05-21  REBAL    AVAXUSDT                           10096.84
+    30 2022-05-31  REBAL    SOLUSDT                            11253.57
+    40 2022-06-10  REBAL    BNBUSDT                            13317.08
+    50 2022-06-20  REBAL    ETHUSDT                            16543.36
+    60 2022-06-30  REBAL    CASH                               17338.41
+    70 2022-07-10  REBAL    CASH                               17338.41
+   110 2022-08-19  REBAL    CASH                               17338.41
+   120 2022-08-29  REBAL    SOLUSDT                            17286.40
+   130 2022-09-08  REBAL    BTCUSDT                            16526.33
+   140 2022-09-18  REBAL    CASH                               16361.53
+   150 2022-09-28  REBAL    ETHUSDT                            16312.45
+  160 2022-10-08  REBAL    ADAUSDT                            16461.65
+  170 2022-10-18  REBAL    ADAUSDT                            18817.02
+  180 2022-10-28  REBAL    CASH                               16622.09
+  192 2022-11-09  REBAL    CASH                               16622.09
+  202 2022-11-19  REBAL    SOLUSDT                            16572.23
+  212 2022-11-29  REBAL    DOTUSDT                            16290.19
+  222 2022-12-09  REBAL    BNBUSDT                            16238.01
+  232 2022-12-19  REBAL    LINKUSDT                           18828.34
+  242 2022-12-29  REBAL    SOLUSDT                            19290.66
+#+end_example
+
+** Funding vs price decomposition
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+best = sweep_results[best_label]
+print(f"Best config: {best_label}")
+print(f"  Total return:  {best['total_return_pct']:.2f}%")
+print(f"    price share: {best['price_return_pct']:.2f}%")
+print(f"    fund share:  {best['funding_return_pct']:.2f}%")
+print(f"  Funding contributed {best['funding_return_pct']/best['total_return_pct']*100:.1f}% of total return"
+      if best['total_return_pct'] != 0 else "  Funding share: n/a (zero return)")
+#+END_SRC
+
+#+RESULTS:
+: Best config: lin-n1-w15
+:   Total return:  87.24%
+:     price share: 78.43%
+:     fund share:  8.81%
+:   Funding contributed 10.1% of total return
+
+* Verdict
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+best_label = max(sweep_results, key=lambda k: sweep_results[k]["calmar_ratio"])
+best = sweep_results[best_label]
+naive_calmar = naive["calmar_ratio"]
+positive_count = sum(1 for m in sweep_results.values() if m["calmar_ratio"] > 0)
+positive_share = positive_count / len(sweep_results)
+
+# Cluster-in-region check: take top 6 by Calmar, look at fit_window breakdown
+# (model-agnostic: lin and exp track the same momentum so splitting them masks
+# real fit_window clustering)
+top6 = sorted(sweep_results.items(), key=lambda kv: kv[1]["calmar_ratio"], reverse=True)[:6]
+top6_keys = [k.split("-")[2] for k, _ in top6]   # fit_window
+from collections import Counter
+mode_pair, mode_count = Counter(top6_keys).most_common(1)[0]
+cluster_ok = mode_count >= 3       # at least half of top 6 share a fit_window
+
+def pass_label(b: bool) -> str:
+    return "PASS" if b else "NO-PASS"
+
+print("=" * 60)
+print("  STAGE REPORT")
+print("=" * 60)
+print()
+print(f"  Best config:                 {best_label}")
+print(f"  Best-config Calmar:          {best['calmar_ratio']:.3f}")
+print(f"  Total return:                {best['total_return_pct']:+.2f}%")
+print(f"    of which price:            {best['price_return_pct']:+.2f}%")
+print(f"    of which funding:          {best['funding_return_pct']:+.2f}%")
+print(f"  Max drawdown:                {best['max_drawdown_pct']:.2f}%")
+print()
+
+s1 = best['calmar_ratio'] > naive_calmar
+print(f"  Stage 1 -- best vs naive equal-weight short:")
+print(f"    Naive Calmar:              {naive_calmar:.3f}")
+print(f"    Best vs naive:             {pass_label(s1)}  (delta {best['calmar_ratio']-naive_calmar:+.3f})")
+print()
+
+s2 = best['calmar_ratio'] > LONG_ONLY_BEAR_CALMAR
+print(f"  Stage 2 -- best vs long-only bear specialist:")
+print(f"    Long-only bear Calmar:     {LONG_ONLY_BEAR_CALMAR}")
+print(f"    Best vs long-only:         {pass_label(s2)}  (delta {best['calmar_ratio']-LONG_ONLY_BEAR_CALMAR:+.3f})")
+print()
+
+s3a = positive_share >= 1/3
+s3b = cluster_ok
+print(f"  Stage 3 -- robustness across configs:")
+print(f"    >= 1/3 configs Calmar+:    {pass_label(s3a)} ({positive_count}/{len(sweep_results)})")
+print(f"    Top-6 fit_window cluster:  {pass_label(s3b)} (dominant: {mode_pair} x{mode_count} of 6)")
+print()
+
+print(f"  Soft flags:")
+fund_share = (best['funding_return_pct']/best['total_return_pct']*100
+              if best['total_return_pct'] != 0 else 0.0)
+print(f"    Funding share of return:   {fund_share:.1f}%  {'<-- FLAG (>80%)' if abs(fund_share) > 80 else ''}")
+print()
+print(f"  Stages summary: S1={pass_label(s1)}  S2={pass_label(s2)}  "
+      f"S3a={pass_label(s3a)}  S3b={pass_label(s3b)}")
+print()
+print(f"  Read these together with the sweep table and the holdings trace.")
+print(f"  A single S1/S2 PASS at top_n=1 indicates concentrated signal, not")
+print(f"  a portfolio-grade strategy. See the follow-up section.")
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+  ============================================================
+    STAGE REPORT
+  ============================================================
+
+    Best config:                 lin-n1-w15
+    Best-config Calmar:          5.641
+    Total return:                +87.24%
+      of which price:            +78.43%
+      of which funding:          +8.81%
+    Max drawdown:                -27.41%
+
+    Stage 1 -- best vs naive equal-weight short:
+      Naive Calmar:              5.920
+      Best vs naive:             NO-PASS  (delta -0.279)
+
+    Stage 2 -- best vs long-only bear specialist:
+      Long-only bear Calmar:     4.6
+      Best vs long-only:         PASS  (delta +1.041)
+
+    Stage 3 -- robustness across configs:
+      >= 1/3 configs Calmar+:    PASS (32/32)
+      Top-6 fit_window cluster:  PASS (dominant: w15 x6 of 6)
+
+    Soft flags:
+      Funding share of return:   10.1%  
+
+    Stages summary: S1=NO-PASS  S2=PASS  S3a=PASS  S3b=PASS
+
+    Read these together with the sweep table and the holdings trace.
+    A single S1/S2 PASS at top_n=1 indicates concentrated signal, not
+    a portfolio-grade strategy. See the follow-up section.
+#+end_example
+
+** Holdings summary for best config
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+# Re-run best config and collect per-day holdings + weights to summarise exposure
+best_label = max(sweep_results, key=lambda k: sweep_results[k]["calmar_ratio"])
+mname, n_str, w_str = best_label.split("-")
+n = int(n_str[1:]); w = int(w_str[1:])
+fit_fn = model_fns[mname]
+p = GemShortParams(top_n=n, fit_window=w)
+
+timestamps = sorted(set(ts for c in candles_by_token.values() for ts in c["timestamp"].values))
+state = ShortPortfolioState(p.initial_capital)
+last_reb = None
+days_held = {t: 0 for t in candles_by_token}                # day-count any exposure
+notional_days = {t: 0.0 for t in candles_by_token}          # sum of (notional / equity) per day
+rebalances = []                                              # list of (date, held_tokens, weights)
+
+for day_idx, ts in enumerate(timestamps):
+    prices = {t: candles_by_token[t][candles_by_token[t]['timestamp']==ts]['close'].values[0]
+              for t in candles_by_token
+              if (candles_by_token[t]['timestamp']==ts).any()}
+    day_ms = int(pd.Timestamp(ts, unit="ms").floor("D").value // 10**6)
+    daily_rates = {t: funding_by_token.get(t, {}).get(day_ms, 0.0) for t in candles_by_token}
+    state.apply_funding(prices, daily_rates)
+    fit_results = {}
+    for t, c in candles_by_token.items():
+        up_to = c[c["timestamp"] <= ts]
+        if p.fit_window and len(up_to) > p.fit_window:
+            up_to = up_to.iloc[-p.fit_window:]
+        if len(up_to) >= 2:
+            pos = fit_fn(up_to, p.atr_window, p.r2_exponent)
+            if pos is not None:
+                fit_results[t] = pos
+    need = day_idx == 0 or (not is_in_cooldown(day_idx, last_reb, p.rebalance_cooldown)
+                            and should_rebalance_short(
+                                {t: s.quantity for t, s in state.shorts.items()},
+                                {t: pp.momentum for t, pp in fit_results.items()},
+                                -p.momentum_floor, -p.momentum_floor))
+    if need:
+        portfolio = build_short_portfolio(list(fit_results.values()), p)
+        targets = {pp.token: pp.weight for pp in portfolio}
+        rebalance_shorts_to_targets(state, targets, prices, p.fee_rate)
+        last_reb = day_idx
+        date_str = pd.Timestamp(ts, unit="ms").strftime("%Y-%m-%d")
+        rebalances.append((date_str, dict(targets)))
+    # Accrue per-day exposure stats
+    equity = state.total_value(prices)
+    for t, pos in state.shorts.items():
+        days_held[t] += 1
+        if equity > 0:
+            notional_days[t] += (pos.quantity * prices.get(t, pos.entry_price)) / equity
+    state.record_snapshot(prices)
+
+n_days = len(timestamps)
+print(f"Config: {best_label}   total days: {n_days}   rebalances: {len(rebalances)}\n")
+print(f"{'token':<10}{'days held':>11}{'% of window':>14}{'avg weight':>14}")
+print("-" * 50)
+rows = []
+for t in sorted(days_held.keys()):
+    if days_held[t] == 0:
+        continue
+    avg_w = notional_days[t] / n_days
+    rows.append((t, days_held[t], days_held[t]/n_days*100, avg_w*100))
+rows.sort(key=lambda r: -r[3])
+for t, d, pct, avgw in rows:
+    print(f"  {t:<10}{d:>9}  {pct:>11.1f}%  {avgw:>11.2f}%")
+
+# Rebalance event log (compact)
+print(f"\nRebalance events:")
+for date_str, targets in rebalances:
+    if not targets:
+        held = "CASH"
+    else:
+        held = ", ".join(f"{t.replace('USDT',''):<5}({w*100:.0f}%)"
+                         for t, w in sorted(targets.items(), key=lambda kv: -kv[1]))
+    print(f"  {date_str}  {held}")
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+  Config: lin-n1-w15   total days: 245   rebalances: 22
+
+  token       days held   % of window    avg weight
+  --------------------------------------------------
+    SOLUSDT          43         17.6%        17.16%
+    ETHUSDT          20          8.2%         8.38%
+    ADAUSDT          20          8.2%         7.68%
+    BNBUSDT          20          8.2%         6.43%
+    BTCUSDT          10          4.1%         4.74%
+    DOTUSDT          10          4.1%         4.34%
+    LINKUSDT         10          4.1%         4.30%
+    AVAXUSDT         10          4.1%         3.46%
+
+  Rebalance events:
+    2022-05-01  CASH
+    2022-05-11  SOL  (100%)
+    2022-05-21  AVAX (100%)
+    2022-05-31  SOL  (100%)
+    2022-06-10  BNB  (100%)
+    2022-06-20  ETH  (100%)
+    2022-06-30  CASH
+    2022-07-10  CASH
+    2022-08-19  CASH
+    2022-08-29  SOL  (100%)
+    2022-09-08  BTC  (100%)
+    2022-09-18  CASH
+    2022-09-28  ETH  (100%)
+    2022-10-08  ADA  (100%)
+    2022-10-18  ADA  (100%)
+    2022-10-28  CASH
+    2022-11-09  CASH
+    2022-11-19  SOL  (100%)
+    2022-11-29  DOT  (100%)
+    2022-12-09  BNB  (100%)
+    2022-12-19  LINK (100%)
+    2022-12-29  SOL  (100%)
+#+end_example
+
+* Squeeze visualisation: ADA, Oct 2022
+
+The single meaningful drawdown for the best config (`lin-n1-w15`) came
+from an ADA short squeeze in October 2022. The model entered an ADA
+short on Oct 8 and re-entered on Oct 18 with 100% weight, both times
+on a clean negative 15-day trend. Between Oct 18 and Oct 28 the price
+rebounded sharply, costing the position ~-11.7% from peak equity.
+
+This cell plots ADAUSDT daily candles for a window around the event
+with the three rebalance dates annotated. The output is referenced
+from the accompanying blog post.
+
+#+BEGIN_SRC jupyter-python :session llms :kernel llms_kernel :async yes :exports both
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+ada = candles_df[candles_df["token"] == "ADAUSDT"].sort_values("timestamp").reset_index(drop=True)
+ada["date"] = pd.to_datetime(ada["timestamp"], unit="ms")
+mask = (ada["date"] >= "2022-09-15") & (ada["date"] <= "2022-11-15")
+win = ada[mask].copy().reset_index(drop=True)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+width = 0.65
+for _, row in win.iterrows():
+    up = row["close"] >= row["open"]
+    body_color = "#2ca02c" if up else "#d62728"
+    # wick
+    ax.plot([row["date"], row["date"]], [row["low"], row["high"]],
+            color="black", lw=0.8, zorder=2)
+    # body
+    body_low  = min(row["open"], row["close"])
+    body_high = max(row["open"], row["close"])
+    height = max(body_high - body_low, (win["high"].max() - win["low"].min()) * 0.001)
+    ax.bar(row["date"], height, bottom=body_low, width=width,
+           color=body_color, edgecolor="black", lw=0.4, zorder=3)
+
+# Annotate the three rebalance events
+events = [
+    ("2022-10-08", "Short entry",                "below"),
+    ("2022-10-18", "Re-entry @ 100% (peak P&L)", "below"),
+    ("2022-10-28", "Forced exit -> CASH",        "above"),
+]
+ymin, ymax = ax.get_ylim()
+yrange = ymax - ymin
+for date_str, label, side in events:
+    ts = pd.Timestamp(date_str)
+    matches = win[win["date"] == ts]
+    if matches.empty:
+        continue
+    row = matches.iloc[0]
+    if side == "above":
+        xy = (ts, row["high"])
+        offset = (0, 32)
+    else:
+        xy = (ts, row["low"])
+        offset = (0, -38)
+    ax.annotate(label, xy=xy, xytext=offset, textcoords="offset points",
+                ha="center", fontsize=10, fontweight="bold",
+                arrowprops=dict(arrowstyle="->", lw=1.2, color="#444"))
+
+# Shaded squeeze interval
+shade_start = pd.Timestamp("2022-10-18")
+shade_end   = pd.Timestamp("2022-10-28")
+ax.axvspan(shade_start, shade_end, color="#d62728", alpha=0.08, zorder=1,
+           label="Squeeze interval (Oct 18 -> Oct 28)")
+
+ax.set_title("ADAUSDT daily candles, Sep 15 - Nov 15 2022\nShort-squeeze event responsible for the model's max drawdown",
+             fontsize=12)
+ax.set_ylabel("Price (USDT)")
+ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+ax.grid(True, axis="y", alpha=0.3)
+ax.legend(loc="upper left", framealpha=0.95)
+fig.autofmt_xdate()
+plt.tight_layout()
+
+out_dir = "../images/2026-05-15-aggressive-bear-short-gem"
+os.makedirs(out_dir, exist_ok=True)
+out_path = f"{out_dir}/ada_squeeze.png"
+plt.savefig(out_path, dpi=140, bbox_inches="tight")
+print(f"Saved {out_path}")
+
+# Print the moves for the writeup
+oct8  = win[win["date"] == "2022-10-08"]["close"].iloc[0]
+oct18 = win[win["date"] == "2022-10-18"]["close"].iloc[0]
+oct28 = win[win["date"] == "2022-10-28"]["close"].iloc[0]
+print(f"\nADA close prices on the three event dates:")
+print(f"  2022-10-08  ${oct8:.4f}   (short entry)")
+print(f"  2022-10-18  ${oct18:.4f}   (re-entry)   move from Oct 8:  {(oct18-oct8)/oct8*100:+.2f}%")
+print(f"  2022-10-28  ${oct28:.4f}   (exit)       move from Oct 18: {(oct28-oct18)/oct18*100:+.2f}%")
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+:RESULTS:
+: Saved ../images/2026-05-15-aggressive-bear-short-gem/ada_squeeze.png
+: 
+: ADA close prices on the three event dates:
+:   2022-10-08  $0.4217   (short entry)
+:   2022-10-18  $0.3621   (re-entry)   move from Oct 8:  -14.13%
+:   2022-10-28  $0.4042   (exit)       move from Oct 18: +11.63%
+[[file:./.ob-jupyter/ec94eeef2c799827ae5508f4abbfd27e77a2fae3.png]]
+:END:
+
+* Follow-up: larger universe re-run
+
+The 10-token universe used here was deliberately small for a fast POC.
+What this run cannot tell us:
+
+- *Does the signal scale to a portfolio?* At top_n>=3 the model's
+  Calmar drops below the long-only-bear benchmark on this universe,
+  but with only 7 fallers available, n>=3 is forced to dilute into
+  weaker signals. A larger candidate pool is a confound, not a result.
+
+- *Is naive's Stage 1 advantage structural or specific?* Naive's lower
+  max drawdown comes from holding the entire 10-token universe
+  equally; a single-asset short is mathematically unable to match that
+  DD floor. Whether the gap survives on a 25-35 token universe with
+  top_n=5 is the question that decides whether this is a real
+  portfolio strategy or a concentration trade.
+
+** Proposed follow-up POC
+
+Re-run the same notebook with these changes:
+
+1. *Expand universe to 25-35 Binance USDⓈ-M majors that existed in May
+   2022.* Use exchange-info to filter by listing date. Reject tokens
+   delisted before Dec 31, 2022.
+
+2. *Re-derive LONG_ONLY_BEAR_CALMAR on the new universe* before any
+   Stage 2 comparison. The 4.6 reference number is universe-specific
+   to gem_bear_models.org and is meaningless on a different universe.
+
+3. *Focus the sweep on top_n in {3, 5, 8}* with fit_window=15. The
+   single-asset configs already worked; the open question is whether
+   diversification at scale retains the return while shrinking the DD.
+
+4. *Pre-register the diagnostic checks before reading results:*
+   - Does naive's Calmar still beat the best config?
+   - Does top_n>=3 retain >= 70% of the n=1 return?
+   - Does the holdings trace show fewer CASH stretches with a wider
+     candidate pool (more chances of a momentum cross)?
+
+** What would change the recommendation
+
+- *PORT-grade signal:* if naive Calmar <= best Calmar AND top_n>=3
+  retains return AND DD shrinks, the strategy is real portfolio-grade.
+
+- *Concentration trade only:* if n=1 still wins after widening the
+  universe but n>=3 collapses, the model is a "find the biggest
+  faller" oracle, not a portfolio strategy. Useful as a signal feed
+  into a discretionary process, not as a Rust autotrader.
+
+- *Universe-fragile:* if the lin-n1-w15 win does not reproduce on the
+  wider universe at all, this POC's result was a small-sample
+  artifact and the track should be dropped.
