@@ -16,6 +16,7 @@ venv/
 .idea/
 *.swp
 *~
+notebooks/ltximg/
 
 # OS
 .DS_Store
